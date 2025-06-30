@@ -26,6 +26,10 @@
 #include <iphlpapi.h>
 #pragma comment(lib, "Ws2_32.lib")
 
+class MainWindow; // forward declaration, so 'extern MainWindow* ...' is legal
+extern MainWindow* g_pMainWindow;
+
+
 #define SCREEN_STREAM_PORT 27016
 #define SCREEN_STREAM_FPS 20
 #define SCREEN_STREAM_QUALITY 60 // JPEG quality
@@ -406,7 +410,12 @@ END:
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	static HBITMAP hBitmap = NULL;
 	static int imgW = 0, imgH = 0;
+	// --- Add static for input socket reuse ---
+	static SOCKET* psktInput = nullptr;
 	switch (msg) {
+	case WM_USER + 100: // Custom message to set the input socket (see StartScreenRecv)
+		psktInput = (SOCKET*)lParam;
+		return 0;
 	case WM_USER + 1: {
 		if (hBitmap) DeleteObject(hBitmap);
 		hBitmap = (HBITMAP)lParam;
@@ -417,6 +426,70 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	}
 	case WM_USER + 2: {
 		SetWindowTextA(hwnd, (const char*)lParam);
+		break;
+	}
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_MBUTTONDOWN:
+	case WM_MBUTTONUP:
+	case WM_MOUSEMOVE:
+	{
+		if (psktInput && *psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_MOUSE;
+
+			POINT pt;
+			pt.x = GET_X_LPARAM(lParam);
+			pt.y = GET_Y_LPARAM(lParam);
+
+			// Convert window coords to normalized absolute screen coords for remote
+			RECT rect;
+			GetClientRect(hwnd, &rect);
+			int winW = rect.right - rect.left, winH = rect.bottom - rect.top;
+			int normX = 0, normY = 0;
+			if (winW > 0 && winH > 0) {
+				normX = (int)((pt.x / (double)winW) * nNormalized);
+				normY = (int)((pt.y / (double)winH) * nNormalized);
+			}
+
+			input.mi.dx = normX;
+			input.mi.dy = normY;
+			input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+			if (msg == WM_LBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+			if (msg == WM_LBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+			if (msg == WM_RBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+			if (msg == WM_RBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+			if (msg == WM_MBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+			if (msg == WM_MBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+
+			send(*psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
+		break;
+	}
+	case WM_MOUSEWHEEL:
+	{
+		if (psktInput && *psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_MOUSE;
+			input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+			input.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
+			send(*psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
+		break;
+	}
+	case WM_KEYDOWN:
+	case WM_KEYUP:
+	{
+		if (psktInput && *psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_KEYBOARD;
+			input.ki.wVk = (WORD)wParam;
+			input.ki.wScan = MapVirtualKeyA((UINT)wParam, MAPVK_VK_TO_VSC);
+			input.ki.dwFlags = (msg == WM_KEYUP) ? KEYEVENTF_KEYUP : 0;
+			send(*psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
 		break;
 	}
 	case WM_PAINT: {
@@ -442,6 +515,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	}
 	return 0;
 }
+
 
 void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	size_t bytesLastSec = 0;
@@ -485,35 +559,8 @@ END:
 	closesocket(skt);
 }
 
-void StartScreenRecv(std::string server_ip, int port) {
-	SOCKET skt = INVALID_SOCKET;
-	if (ConnectScreenStreamServer(skt, server_ip, port) != 0) {
-		MessageBoxA(NULL, "Failed to connect to screen stream server!", "Remote", MB_OK | MB_ICONERROR);
-		return;
 
-	}
-	WNDCLASSA wc = { 0 };
-	wc.lpfnWndProc = ScreenWndProc;
-	wc.lpszClassName = "RemoteScreenWnd";
-	wc.hInstance = GetModuleHandle(NULL);
-	RegisterClassA(&wc);
 
-	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
-		CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, NULL, NULL, wc.hInstance, NULL);
-	ShowWindow(hwnd, SW_SHOWNORMAL);
-
-	std::thread t(ScreenRecvThread, skt, hwnd, server_ip);
-	t.detach();
-
-	MSG msg = { 0 };
-	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
-		if (!IsDialogMessage(hwnd, &msg)) {
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
-		if (!IsWindow(hwnd)) break;
-	}
-}
 
 // BaseWindow was taken from
 // https://github.com/microsoft/Windows-classic-samples/blob/master/Samples/Win7Samples/begin/LearnWin32/BaseWindow/cpp/main.cpp
@@ -729,6 +776,8 @@ private:
 
 	} Server;
 
+	public:
+
 	struct ClientData
 	{
 		std::string ip;
@@ -786,6 +835,46 @@ MainWindow::MainWindow()
 MainWindow::~MainWindow()
 {
 	SaveConfig();
+}
+
+MainWindow* g_pMainWindow = nullptr;
+
+void StartScreenRecv(std::string server_ip, int port) {
+	// Reuse main input socket if possible
+	SOCKET* psktInput = nullptr;
+	if (g_pMainWindow && g_pMainWindow->Client.isConnected)
+		psktInput = &g_pMainWindow->Client.sktServer;
+
+	SOCKET skt = INVALID_SOCKET;
+	if (ConnectScreenStreamServer(skt, server_ip, port) != 0) {
+		MessageBoxA(NULL, "Failed to connect to screen stream server!", "Remote", MB_OK | MB_ICONERROR);
+		return;
+	}
+	WNDCLASSA wc = { 0 };
+	wc.lpfnWndProc = ScreenWndProc;
+	wc.lpszClassName = "RemoteScreenWnd";
+	wc.hInstance = GetModuleHandle(NULL);
+	RegisterClassA(&wc);
+
+	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, NULL, NULL, wc.hInstance, NULL);
+
+	// Pass input socket pointer to the window
+	SendMessage(hwnd, WM_USER + 100, 0, (LPARAM)psktInput);
+
+	ShowWindow(hwnd, SW_SHOWNORMAL);
+
+	std::thread t(ScreenRecvThread, skt, hwnd, server_ip);
+	t.detach();
+
+	MSG msg = { 0 };
+	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
+		if (!IsDialogMessage(hwnd, &msg)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		if (!IsWindow(hwnd)) break;
+	}
 }
 
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1904,6 +1993,7 @@ int main()
 		return 1;
 	}
 	MainWindow win;
+	g_pMainWindow = &win; // <-- Set the global pointer after win is defined
 	if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, 477, 340, NULL))
 	{
 		std::cout << "error creating the main window: " << GetLastError() << std::endl;
