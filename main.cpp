@@ -10,14 +10,25 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <vector>
+#include <atomic>
+#include <chrono>
 
 #include <Windows.h>
 #include <windowsx.h>
+
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment (lib, "Gdiplus.lib")
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #pragma comment(lib, "Ws2_32.lib")
+
+#define SCREEN_STREAM_PORT 27016
+#define SCREEN_STREAM_FPS 20
+#define SCREEN_STREAM_QUALITY 60 // JPEG quality
 
 #define BTN_MODE 1
 #define BTN_START 2
@@ -45,8 +56,107 @@ int nScreenHeight[2] = { 1080 , 1440 };
 
 const int nNormalized = 65535;
 
+// GDI+ helpers for screen streaming
+ULONG_PTR gdiplusToken;
+void InitGDIPlus() {
+	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+	Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+}
+void ShutdownGDIPlus() {
+	Gdiplus::GdiplusShutdown(gdiplusToken);
+}
+HBITMAP CaptureScreenBitmap(int& width, int& height) {
+	HDC hScreenDC = GetDC(NULL);
+	HDC hMemDC = CreateCompatibleDC(hScreenDC);
+	width = GetSystemMetrics(SM_CXSCREEN);
+	height = GetSystemMetrics(SM_CYSCREEN);
+	HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+	HGDIOBJ oldObj = SelectObject(hMemDC, hBitmap);
+	BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY);
+	SelectObject(hMemDC, oldObj);
+	DeleteDC(hMemDC);
+	ReleaseDC(NULL, hScreenDC);
+	return hBitmap;
+}
+bool BitmapToJPEGBuffer(HBITMAP hBitmap, std::vector<BYTE>& outBuffer, int quality = 60) {
+	using namespace Gdiplus;
+	Bitmap bmp(hBitmap, NULL);
+	CLSID clsidEncoder;
+	UINT num = 0, size = 0;
+	GetImageEncodersSize(&num, &size);
+	if (size == 0) return false;
+	std::vector<BYTE> buffer(size);
+	ImageCodecInfo* pImageCodecInfo = (ImageCodecInfo*)buffer.data();
+	GetImageEncoders(num, size, pImageCodecInfo);
+	for (UINT j = 0; j < num; ++j) {
+		if (wcscmp(pImageCodecInfo[j].MimeType, L"image/jpeg") == 0) {
+			clsidEncoder = pImageCodecInfo[j].Clsid;
+			break;
+		}
+	}
+	IStream* istream = NULL;
+	CreateStreamOnHGlobal(NULL, TRUE, &istream);
+	EncoderParameters params;
+	params.Count = 1;
+	params.Parameter[0].Guid = EncoderQuality;
+	params.Parameter[0].Type = EncoderParameterValueTypeLong;
+	params.Parameter[0].NumberOfValues = 1;
+	ULONG q = quality;
+	params.Parameter[0].Value = &q;
+	if (bmp.Save(istream, &clsidEncoder, &params) == Ok) {
+		STATSTG stat;
+		istream->Stat(&stat, STATFLAG_NONAME);
+		DWORD bufSize = (DWORD)stat.cbSize.QuadPart;
+		outBuffer.resize(bufSize);
+		LARGE_INTEGER li = { 0 };
+		istream->Seek(li, STREAM_SEEK_SET, NULL);
+		ULONG read = 0;
+		istream->Read(outBuffer.data(), bufSize, &read);
+		istream->Release();
+		return true;
+	}
+	istream->Release();
+	return false;
+}
+HBITMAP JPEGBufferToBitmap(const BYTE* data, size_t len) {
+	using namespace Gdiplus;
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+	memcpy(GlobalLock(hMem), data, len);
+	GlobalUnlock(hMem);
+	IStream* istream = NULL;
+	CreateStreamOnHGlobal(hMem, FALSE, &istream);
+	Bitmap* bmp = Bitmap::FromStream(istream, FALSE);
+	HBITMAP hBitmap = NULL;
+	bmp->GetHBITMAP(Gdiplus::Color(0, 0, 0), &hBitmap);
+	delete bmp;
+	istream->Release();
+	GlobalFree(hMem);
+	return hBitmap;
+}
 
+// SOCKETS function declarations for use in other translation units
+int InitializeServer(SOCKET& sktListen, int port);
+int InitializeScreenStreamServer(SOCKET& sktListen, int port);
+int BroadcastInput(std::vector<SOCKET> vsktSend, INPUT* input);
+int TerminateServer(SOCKET& sktListen, std::vector<SOCKET>& sktClients);
+int InitializeClient();
+int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port);
+int ConnectScreenStreamServer(SOCKET& sktConn, std::string serverAdd, int port);
+int ReceiveServer(SOCKET sktConn, INPUT& data);
+int CloseConnection(SOCKET* sktConn);
 
+// Externs for screen streaming global state
+extern std::atomic<bool> g_screenStreamActive;
+extern std::atomic<size_t> g_screenStreamBytes;
+extern std::atomic<int> g_screenStreamFPS;
+extern std::atomic<int> g_screenStreamW;
+extern std::atomic<int> g_screenStreamH;
+
+// Streaming server/client declarations (implementations in another file)
+void ScreenStreamServerThread(SOCKET sktClient);
+LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip);
+void StartScreenRecv(std::string server_ip, int port);
 
 
 // ================================================
@@ -102,6 +212,11 @@ int InitializeServer(SOCKET& sktListen, int port) {
 	freeaddrinfo(result);
 	return 0;
 }
+
+int InitializeScreenStreamServer(SOCKET& sktListen, int port) {
+	return InitializeServer(sktListen, port);
+}
+
 int BroadcastInput(std::vector<SOCKET> vsktSend, INPUT* input) {
 	int iResult = 0;
 
@@ -186,6 +301,11 @@ int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port) {
 	}
 	return 0;
 }
+
+int ConnectScreenStreamServer(SOCKET& sktConn, std::string serverAdd, int port) {
+	return ConnectServer(sktConn, serverAdd, port);
+}
+
 int ReceiveServer(SOCKET sktConn, INPUT& data) {
 	INPUT* buff = new INPUT;
 	//std::cout << "receiving..." << std::endl;
@@ -223,6 +343,184 @@ int CloseConnection(SOCKET* sktConn) {
 	closesocket(*sktConn);
 	//WSACleanup();
 	return 0;
+}
+
+// =================== SCREEN STREAM SERVER =====================
+
+std::atomic<bool> g_screenStreamActive(false);
+std::atomic<size_t> g_screenStreamBytes(0);
+std::atomic<int> g_screenStreamFPS(0);
+std::atomic<int> g_screenStreamW(0);
+std::atomic<int> g_screenStreamH(0);
+
+void ScreenStreamServerThread(SOCKET sktClient) {
+	using namespace std::chrono;
+	int width = 0, height = 0;
+	int fps = SCREEN_STREAM_FPS;
+	int quality = SCREEN_STREAM_QUALITY;
+	int frameInterval = 1000 / fps;
+
+	g_screenStreamActive = true;
+	g_screenStreamBytes = 0;
+	g_screenStreamFPS = 0;
+
+	auto lastPrint = steady_clock::now();
+	int frames = 0;
+	size_t bytes = 0;
+
+	while (g_screenStreamActive) {
+		auto start = steady_clock::now();
+		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
+		std::vector<BYTE> jpgBuffer;
+		if (!BitmapToJPEGBuffer(hBitmap, jpgBuffer, quality)) {
+			DeleteObject(hBitmap);
+			continue;
+		}
+		DeleteObject(hBitmap);
+		uint32_t sz = jpgBuffer.size();
+		uint32_t szNet = htonl(sz);
+
+		int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
+		if (ret != sizeof(szNet)) break;
+		size_t offset = 0;
+		while (offset < sz) {
+			int sent = send(sktClient, (const char*)(jpgBuffer.data() + offset), sz - offset, 0);
+			if (sent <= 0) goto END;
+			offset += sent;
+		}
+		frames++;
+		bytes += sz + sizeof(szNet);
+		g_screenStreamW = width;
+		g_screenStreamH = height;
+
+		auto now = steady_clock::now();
+		if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
+			g_screenStreamFPS = frames;
+			g_screenStreamBytes = bytes;
+			frames = 0;
+			bytes = 0;
+			lastPrint = now;
+		}
+		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
+		if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
+	}
+END:
+	closesocket(sktClient);
+	g_screenStreamActive = false;
+}
+
+// ============ SCREEN STREAM CLIENT WINDOW ============
+
+LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	static HBITMAP hBitmap = NULL;
+	static int imgW = 0, imgH = 0;
+	switch (msg) {
+	case WM_USER + 1: {
+		if (hBitmap) DeleteObject(hBitmap);
+		hBitmap = (HBITMAP)lParam;
+		imgW = LOWORD(wParam);
+		imgH = HIWORD(wParam);
+		InvalidateRect(hwnd, NULL, FALSE);
+		break;
+	}
+	case WM_USER + 2: {
+		SetWindowTextA(hwnd, (const char*)lParam);
+		break;
+	}
+	case WM_PAINT: {
+		PAINTSTRUCT ps;
+		HDC hdc = BeginPaint(hwnd, &ps);
+		if (hBitmap) {
+			HDC hMem = CreateCompatibleDC(hdc);
+			HGDIOBJ oldObj = SelectObject(hMem, hBitmap);
+			BITMAP bm;
+			GetObject(hBitmap, sizeof(bm), &bm);
+			StretchBlt(hdc, 0, 0, ps.rcPaint.right, ps.rcPaint.bottom, hMem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+			SelectObject(hMem, oldObj);
+			DeleteDC(hMem);
+		}
+		EndPaint(hwnd, &ps);
+		break;
+	}
+	case WM_DESTROY:
+		if (hBitmap) DeleteObject(hBitmap);
+		break;
+	default:
+		return DefWindowProc(hwnd, msg, wParam, lParam);
+	}
+	return 0;
+}
+
+void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
+	size_t bytesLastSec = 0;
+	int framesLastSec = 0;
+	int scrW = 0, scrH = 0;
+	auto lastSec = std::chrono::steady_clock::now();
+	while (true) {
+		uint32_t szNet = 0;
+		int ret = recv(skt, (char*)&szNet, sizeof(szNet), MSG_WAITALL);
+		if (ret != sizeof(szNet)) break;
+		uint32_t sz = ntohl(szNet);
+		std::vector<BYTE> buffer(sz);
+		size_t offset = 0;
+		while (offset < sz) {
+			int got = recv(skt, (char*)(buffer.data() + offset), sz - offset, 0);
+			if (got <= 0) goto END;
+			offset += got;
+		}
+		HBITMAP hBmp = JPEGBufferToBitmap(buffer.data(), buffer.size());
+		BITMAP bmInfo;
+		GetObject(hBmp, sizeof(bmInfo), &bmInfo);
+		scrW = bmInfo.bmWidth;
+		scrH = bmInfo.bmHeight;
+		PostMessage(hwnd, WM_USER + 1, MAKELPARAM(scrW, scrH), (LPARAM)hBmp);
+		bytesLastSec += sz + sizeof(szNet);
+		framesLastSec++;
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(now - lastSec).count() >= 1) {
+			double mbps = (bytesLastSec * 8.0) / 1e6;
+			char title[256];
+			snprintf(title, sizeof(title), "Remote Screen | IP: %s | FPS: %d | Mbps: %.2f | Size: %dx%d",
+				ip.c_str(), framesLastSec, mbps, scrW, scrH);
+			PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
+			bytesLastSec = 0;
+			framesLastSec = 0;
+			lastSec = now;
+		}
+	}
+END:
+	PostMessage(hwnd, WM_CLOSE, 0, 0);
+	closesocket(skt);
+}
+
+void StartScreenRecv(std::string server_ip, int port) {
+	SOCKET skt = INVALID_SOCKET;
+	if (ConnectScreenStreamServer(skt, server_ip, port) != 0) {
+		MessageBoxA(NULL, "Failed to connect to screen stream server!", "Remote", MB_OK | MB_ICONERROR);
+		return;
+
+	}
+	WNDCLASSA wc = { 0 };
+	wc.lpfnWndProc = ScreenWndProc;
+	wc.lpszClassName = "RemoteScreenWnd";
+	wc.hInstance = GetModuleHandle(NULL);
+	RegisterClassA(&wc);
+
+	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, NULL, NULL, wc.hInstance, NULL);
+	ShowWindow(hwnd, SW_SHOWNORMAL);
+
+	std::thread t(ScreenRecvThread, skt, hwnd, server_ip);
+	t.detach();
+
+	MSG msg = { 0 };
+	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
+		if (!IsDialogMessage(hwnd, &msg)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		if (!IsWindow(hwnd)) break;
+	}
 }
 
 // BaseWindow was taken from
@@ -467,7 +765,7 @@ private:
 	InputBox m_itxtIP;
 	InputBox m_itxtPort;
 	StaticBox m_stxtKeyboard, m_stxtMouse, m_stxtMouseBtn, m_stxtMouseOffset;
-};
+}; // <-- CLOSE CLASS DEFINITION
 
 MainWindow::MainWindow()
 {
@@ -677,6 +975,7 @@ int MainWindow::HandleCommand(UINT uMsg, WPARAM wParam, LPARAM lParam)
 	}
 }
 int MainWindow::HandleCreate(UINT uMsg, WPARAM wParam, LPARAM lParam)
+
 {
 	//m_btnOk.Create(L"OK", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 0, 50, 50, 100, 100, this->m_hwnd);
 	CreateWindowA("BUTTON", "Mode", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_GROUPBOX, 20, 10, 190, 60, m_hwnd, (HMENU)BTN_MODE, (HINSTANCE)GetWindowLong(m_hwnd, GWL_HINSTANCE), NULL);
@@ -709,10 +1008,7 @@ int MainWindow::HandlePaint(UINT uMsg, WPARAM wParam, LPARAM lParam)
 	PAINTSTRUCT ps;
 	HDC hdc;
 	RECT clientRect;
-	RECT textRect;
-	HRGN bgRgn;
 	HBRUSH hBrush;
-	HPEN hPen;
 
 
 	hdc = BeginPaint(m_hwnd, &ps);
@@ -818,14 +1114,14 @@ std::string VKeyToString(unsigned int vk)
 	case VK_MENU: return "ALT";
 	case VK_CAPITAL: return "CAP LOCK";
 	case VK_KANA: return "IME Kana";
-	//case VK_HANGUEL: return "IME Hnaguel";
-	//case VK_HANGUL: return "IME Hangul";
-	//case VK_IME_ON: return "IME On";
+		//case VK_HANGUEL: return "IME Hnaguel";
+		//case VK_HANGUL: return "IME Hangul";
+		//case VK_IME_ON: return "IME On";
 	case VK_JUNJA: return "IME JUNA";
 	case VK_FINAL: return "IME FINAL";
 	case VK_HANJA: return "IME HANJA";
-	//case VK_KANJI: return "IME Kanji";
-	//case VK_IME_OFF: return "IME Off";
+		//case VK_KANJI: return "IME Kanji";
+		//case VK_IME_OFF: return "IME Off";
 	case VK_ESCAPE: return "ESC";
 	case VK_CONVERT: return "IME CONVERT";
 	case VK_NONCONVERT: return "IME NONCONVERT";
@@ -1153,6 +1449,7 @@ void MainWindow::ConvertInput(PRAWINPUT pRaw, INPUT* pInput) {
 		if (pRaw->data.mouse.lLastX != 0 || pRaw->data.mouse.lLastY != 0) {
 			pInput->mi.dwFlags = pInput->mi.dwFlags | MOUSEEVENTF_MOVE;
 		}
+
 		else if (pRaw->data.mouse.usFlags == MOUSE_MOVE_ABSOLUTE) {
 			pInput->mi.dwFlags = pInput->mi.dwFlags | MOUSEEVENTF_ABSOLUTE;
 		}
@@ -1279,14 +1576,36 @@ int MainWindow::ServerStart()
 		Log("Starting sending thread");
 		Server.tSend = std::thread(&MainWindow::SendThread, this);
 
+		// SCREEN STREAM: Start a screen stream server socket on SCREEN_STREAM_PORT
+		SOCKET* sktScreenListenPtr = new SOCKET(INVALID_SOCKET);
+		if (InitializeScreenStreamServer(*sktScreenListenPtr, SCREEN_STREAM_PORT) == 0) {
+			std::thread([sktScreenListenPtr]() {
+				while (true) {
+					if (listen(*sktScreenListenPtr, 1) == SOCKET_ERROR) break;
+					sockaddr_in client_addr;
+					int addrlen = sizeof(client_addr);
+					SOCKET sktClient = accept(*sktScreenListenPtr, (sockaddr*)&client_addr, &addrlen);
+					if (sktClient == INVALID_SOCKET) continue;
+					std::thread(ScreenStreamServerThread, sktClient).detach();
+				}
+				closesocket(*sktScreenListenPtr);
+				delete sktScreenListenPtr;
+				}).detach();
+				Log("Screen streaming server started");
+		}
+		else {
+			delete sktScreenListenPtr;
+			Log("Could not start screen streaming server");
+		}
 		Server.tListen.detach();
 		Server.tSend.detach();
 	}
 	return 0;
 }
+
 int MainWindow::ServerTerminate()
-{
-	if (Server.isOnline)
+{		
+    if (Server.isOnline)
 	{
 		int error = 1;
 		Log("Terminate");
@@ -1308,14 +1627,15 @@ int MainWindow::ServerTerminate()
 		Button_Enable(m_btnPause.Window(), false);
 		Button_Enable(m_btnModeServer.Window(), true);
 		Button_Enable(m_btnModeClient.Window(), true);
-
+		// Also stop screen streaming
+		g_screenStreamActive = false;
 		return 0;
 	}
 	return 1;
 }
 
 int MainWindow::ClientConnect()
-{
+  {
 	char out_ip[50];
 	char out_port[50];
 	int error = 1;
@@ -1331,28 +1651,32 @@ int MainWindow::ClientConnect()
 	if (error == 1) {
 		Log("Couldn't connect");
 		//MessageBox(NULL, "couldn't connect", "Remote", MB_OK);
-	}
+		}
 	else {
 		Log("Connected!");
 		Client.isConnected = true;
 		UpdateGuiControls();
-
+		
 		//start receive thread that will receive data
 		Log("Starting receive thread");
 		Client.tRecv = std::thread(&MainWindow::ReceiveThread, this);
-
+		
 		// start send input thread that sends the received input
 		Log("Starting input thread");
 		Client.tSendInput = std::thread(&MainWindow::OutputThread, this);
-
+		
 		Client.tSendInput.detach();
 		Client.tRecv.detach();
-
-	}
+		// SCREEN STREAM: Start a new window to receive the screen stream
+		std::thread([ip = Client.ip](){
+		StartScreenRecv(ip, SCREEN_STREAM_PORT);
+		}).detach();
+		Log("Screen streaming client started");
+		}
 	return 0;
-}
+	}
 int MainWindow::ClientDisconnect()
-{
+   {
 	Log("Disconnect");
 	CloseConnection(&Client.sktServer);
 	//MessageBox(m_hwnd, "Disconnect", "Remote", MB_OK);
@@ -1371,7 +1695,7 @@ int MainWindow::ClientDisconnect()
 }
 
 int MainWindow::ListenThread()
-{
+  {
 	bool socket_found = false;
 	int index = 0;
 	while (Server.isOnline && Data.nMode == MODE::SERVER)
@@ -1416,27 +1740,27 @@ int MainWindow::ListenThread()
 }
 int MainWindow::SendThread()
 {
-	while (Server.isOnline && Data.nMode == MODE::SERVER)
-	{
-		std::unique_lock<std::mutex> lock(Server.mu_input);
-		if (Server.inputQueue.empty())
-		{
-			Server.cond_input.wait(lock);
-		}
-		else
-		{
-			INPUT inputData = Server.inputQueue.front();
-			int bytes = 0;
-			for (auto& client : Server.ClientsInformation)
+	 while (Server.isOnline && Data.nMode == MODE::SERVER)
+		 {
+		 std::unique_lock<std::mutex> lock(Server.mu_input);
+		 if (Server.inputQueue.empty())
 			{
-				//std::cout << "Searching for client" << std::endl;
-				if (client.socket != INVALID_SOCKET)
-				{
-					//std::cout << "Sending..." << std::endl;
+			 Server.cond_input.wait(lock);
+			}
+		 else
+		 {
+			 INPUT inputData = Server.inputQueue.front();
+			 int bytes = 0;
+			 for (auto& client : Server.ClientsInformation)
+				  {
+				 //std::cout << "Searching for client" << std::endl;
+				 if (client.socket != INVALID_SOCKET)
+					  {
+					 //std::cout << "Sending..." << std::endl;
 					bytes = send(client.socket, (char*)&inputData, sizeof(INPUT), 0);
-
-					if (bytes < 0)
-					{
+					
+					if (bytes == SOCKET_ERROR)
+					 {
 						// client disconnected
 						Log("Client nb " + std::to_string(client.id) + " disconnected: " + std::to_string(client.socket) + "\nIP: " + client.ip);
 						Server.nConnected--;
@@ -1445,16 +1769,16 @@ int MainWindow::SendThread()
 						client.id = -1;
 						client.ip = "";
 						Server.cond_listen.notify_all();
-					}
-				}
-			}
-			//lock.lock();
+						}
+					 }
+				 }
+			 //lock.lock();
 			Server.inputQueue.pop();
+			}
 		}
+	   Log("Sending thread - ended");
+	 return 0;
 	}
-	Log("Sending thread - ended");
-	return 0;
-}
 int MainWindow::ReceiveThread()
 {
 	while (Client.isConnected && Data.nMode == MODE::CLIENT)
@@ -1477,9 +1801,9 @@ int MainWindow::ReceiveThread()
 	}
 	return 0;
 }
-int MainWindow::OutputThread()
+	 int MainWindow::OutputThread()
 {
-	while (Client.isConnected && Data.nMode == MODE::CLIENT)
+		 while (Client.isConnected && Data.nMode == MODE::CLIENT)
 	{
 		std::unique_lock<std::mutex> lock(Client.mu_input);
 		if (Client.inputQueue.empty())
@@ -1511,8 +1835,8 @@ int MainWindow::OutputThread()
 }
 
 
-bool MainWindow::SaveConfig()
-{
+ bool MainWindow::SaveConfig()
+ {
 	std::fstream f(configName, std::fstream::out | std::fstream::trunc);
 	if (!f.is_open())
 	{
@@ -1545,7 +1869,7 @@ bool MainWindow::LoadConfig()
 		std::getline(f, line);
 		s << line;
 		s >> param >> sPort;
-		
+
 		s.clear();
 	}
 
@@ -1568,9 +1892,9 @@ bool MainWindow::LoadConfig()
 	}
 
 	std::cout << "Config Loaded:\n"
-			  << "    port = " << sPort << '\n'
-			  << "    server ip = " << Client.ip << '\n'
-			  << "    max number clients = " << Server.maxClients << std::endl;
+		<< "    port = " << sPort << '\n'
+		<< "    server ip = " << Client.ip << '\n'
+		<< "    max number clients = " << Server.maxClients << std::endl;
 
 	f.close();
 
@@ -1579,18 +1903,18 @@ bool MainWindow::LoadConfig()
 
 int main()
 {
+	InitGDIPlus();
 	HMENU hMenu;
 	MainWindow win;
 
 	if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, 477, 340, NULL))
 	{
 		std::cout << "error creating the main window: " << GetLastError() << std::endl;
+		ShutdownGDIPlus();
 		return 0;
 	}
 
 	ShowWindow(win.Window(), 1);
-
-	// Run the message loop.
 
 	MSG msg = { };
 	while (GetMessage(&msg, NULL, 0, 0))
@@ -1598,6 +1922,6 @@ int main()
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
-
+	ShutdownGDIPlus();
 	return 0;
 }
