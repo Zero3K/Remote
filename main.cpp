@@ -182,7 +182,6 @@ int InitializeServer(SOCKET& sktListen, int port) {
 
 	if (iResult != 0) {
 		std::cout << "getaddrinfo failed: " << iResult << std::endl;
-		WSACleanup();
 		return 1;
 	}
 
@@ -193,7 +192,6 @@ int InitializeServer(SOCKET& sktListen, int port) {
 
 	if (sktListen == INVALID_SOCKET) {
 		std::cout << "Error at socket(): " << WSAGetLastError() << std::endl;
-		WSACleanup();
 		freeaddrinfo(result);
 		return 1;
 	}
@@ -204,7 +202,6 @@ int InitializeServer(SOCKET& sktListen, int port) {
 
 	if (iResult == SOCKET_ERROR) {
 		std::cout << "bind failed with error: " << WSAGetLastError() << std::endl;
-		WSACleanup();
 		freeaddrinfo(result);
 		return 1;
 	}
@@ -244,7 +241,6 @@ int TerminateServer(SOCKET& sktListen, std::vector<SOCKET>& sktClients) {
 		}
 	}
 	closesocket(sktListen);
-	//WSACleanup();
 	return 0;
 }
 int InitializeClient() {
@@ -273,7 +269,6 @@ int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port) {
 	iResult = getaddrinfo(serverAdd.c_str(), std::to_string(port).c_str(), &hints, &result);
 	if (iResult != 0) {
 		std::cout << "getaddrinfo failed with error: " << iResult << std::endl;
-		WSACleanup();
 		return 1;
 	}
 
@@ -281,7 +276,6 @@ int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port) {
 	sktConn = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
 	if (sktConn == INVALID_SOCKET) {
 		std::cout << "socket failed with error: " << WSAGetLastError() << std::endl;
-		WSACleanup();
 		return 1;
 	}
 
@@ -296,7 +290,6 @@ int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port) {
 
 	if (sktConn == INVALID_SOCKET) {
 		std::cout << "Unable to connect to server" << std::endl;
-		WSACleanup();
 		return 1;
 	}
 	return 0;
@@ -341,7 +334,6 @@ int ReceiveServer(SOCKET sktConn, INPUT& data) {
 }
 int CloseConnection(SOCKET* sktConn) {
 	closesocket(*sktConn);
-	//WSACleanup();
 	return 0;
 }
 
@@ -794,7 +786,6 @@ MainWindow::MainWindow()
 MainWindow::~MainWindow()
 {
 	SaveConfig();
-	WSACleanup();
 }
 
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -1904,12 +1895,19 @@ bool MainWindow::LoadConfig()
 int main()
 {
 	InitGDIPlus();
-	HMENU hMenu;
+	// ---- Ensure WSAStartup is called ONCE here ----
+	WSADATA wsadata;
+	int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
+	if (wsaResult != 0) {
+		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
+		ShutdownGDIPlus();
+		return 1;
+	}
 	MainWindow win;
-
 	if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, 477, 340, NULL))
 	{
 		std::cout << "error creating the main window: " << GetLastError() << std::endl;
+		WSACleanup();
 		ShutdownGDIPlus();
 		return 0;
 	}
@@ -1922,6 +1920,7 @@ int main()
 		TranslateMessage(&msg);
 		DispatchMessage(&msg);
 	}
+	WSACleanup();
 	ShutdownGDIPlus();
 	return 0;
 }
