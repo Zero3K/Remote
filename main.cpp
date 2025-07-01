@@ -1026,17 +1026,20 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			continue;
 		}
 
+		size_t bytesThisFrame = 4; // nRects field
+		bool frame_error = false;
+
 		for (uint32_t i = 0; i < nRects; ++i) {
 			uint32_t x, y, w, h, qoiLen;
-			if (recv(skt, (char*)&x, 4, MSG_WAITALL) != 4 ||
-				recv(skt, (char*)&y, 4, MSG_WAITALL) != 4 ||
-				recv(skt, (char*)&w, 4, MSG_WAITALL) != 4 ||
-				recv(skt, (char*)&h, 4, MSG_WAITALL) != 4 ||
-				recv(skt, (char*)&qoiLen, 4, MSG_WAITALL) != 4) {
-				debug_log("Socket closed or error on rect header\n");
-				running = false;
-				break;
-			}
+			int got;
+
+			got = recv(skt, (char*)&x, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&y, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&w, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&h, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&qoiLen, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
+			bytesThisFrame += 4 * 5;
+
 			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
 
 			if (w == 0 || h == 0 || qoiLen == 0) {
@@ -1047,13 +1050,15 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			std::vector<uint8_t> qoiData(qoiLen);
 			size_t offset = 0;
 			while (offset < qoiLen) {
-				int got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
+				got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
 				if (got <= 0) {
 					debug_log("Socket closed or error on qoi data\n");
+					frame_error = true;
 					running = false;
 					break;
 				}
 				offset += got;
+				bytesThisFrame += got;
 			}
 			if (!running) break;
 
@@ -1088,6 +1093,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 					debug_log("CreateDIBSection failed (w=%d h=%d)\n", needW, needH);
 					LeaveCriticalSection(&bmpState->cs);
 					free(decoded);
+					frame_error = true;
 					running = false;
 					break;
 				}
@@ -1131,8 +1137,10 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			InvalidateRect(hwnd, NULL, FALSE);
 		}
 
-		bytesLastSec++;
+		if (frame_error) break;
+
 		framesLastSec++;
+		bytesLastSec += bytesThisFrame;
 		auto now = steady_clock::now();
 		if (duration_cast<seconds>(now - lastSec).count() >= 1) {
 			double mbps = (bytesLastSec * 8.0) / 1e6;
