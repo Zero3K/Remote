@@ -740,7 +740,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 	switch (msg) {
 	case WM_CREATE:
-		// Allocate state and store in GWLP_USERDATA
 		bmpState = new ScreenBitmapState();
 		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)bmpState);
 		break;
@@ -751,14 +750,8 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		return 0;
 
 	case WM_USER + 1:   // New bitmap and size from thread
-		if (bmpState) {
-			if (bmpState->hBitmap) DeleteObject(bmpState->hBitmap);
-			bmpState->hBitmap = (HBITMAP)lParam;
-			bmpState->imgW = LOWORD(wParam);
-			bmpState->imgH = HIWORD(wParam);
-			InvalidateRect(hwnd, NULL, FALSE);
-		}
-		break;
+		// No longer handled: thread never allocates a new ScreenBitmapState, only updates its members
+		return 0;
 
 	case WM_USER + 2:
 		SetWindowTextA(hwnd, (const char*)lParam);
@@ -878,7 +871,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		return 1; // Prevent flicker
 
 	case WM_PAINT: {
-		ScreenBitmapState* bmpState = (ScreenBitmapState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
 
@@ -925,7 +917,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 		if (bmpState) {
 			EnterCriticalSection(&bmpState->cs);
-			if (bmpState->hBitmap) {
+			if (bmpState->hBitmap && bmpState->dibBits) {
 				BITMAP bm = {};
 				if (GetObject(bmpState->hBitmap, sizeof(bm), &bm) == sizeof(bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
 					int srcW = bm.bmWidth;
@@ -981,7 +973,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			hDoubleBufBmp = NULL;
 			pDoubleBufBits = NULL;
 		}
-		ScreenBitmapState* bmpState = (ScreenBitmapState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 		if (bmpState) {
 			delete bmpState;
 			SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
@@ -1004,8 +995,13 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	int framesLastSec = 0;
 	auto lastSec = steady_clock::now();
 
-	ScreenBitmapState* bmpState = new ScreenBitmapState();
-	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)bmpState);
+	// Do NOT create/delete ScreenBitmapState here.
+	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+	if (!bmpState) {
+		OutputDebugStringA("ScreenRecvThread: bmpState is NULL!\n");
+		closesocket(skt);
+		return;
+	}
 
 	auto debug_log = [](const char* fmt, ...) {
 		char buf[512];
@@ -1016,7 +1012,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 		OutputDebugStringA(buf);
 	};
 
-	while (true) {
+	bool running = true;
+	while (running) {
 		uint32_t nRectsNet = 0;
 		int ret = recv(skt, (char*)&nRectsNet, 4, MSG_WAITALL);
 		if (ret != 4) {
@@ -1037,7 +1034,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				recv(skt, (char*)&h, 4, MSG_WAITALL) != 4 ||
 				recv(skt, (char*)&qoiLen, 4, MSG_WAITALL) != 4) {
 				debug_log("Socket closed or error on rect header\n");
-				goto END;
+				running = false;
+				break;
 			}
 			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
 
@@ -1052,10 +1050,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				int got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
 				if (got <= 0) {
 					debug_log("Socket closed or error on qoi data\n");
-					goto END;
+					running = false;
+					break;
 				}
 				offset += got;
 			}
+			if (!running) break;
 
 			qoi_desc desc;
 			uint8_t* decoded = (uint8_t*)qoi_decode(qoiData.data(), qoiLen, &desc, 4);
@@ -1064,15 +1064,15 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				continue;
 			}
 
+			// --- All bitmap and framebuffer mutation must be done together under lock ---
+			EnterCriticalSection(&bmpState->cs);
+
 			int needW = std::max(bmpState->imgW, static_cast<int>(x + w));
 			int needH = std::max(bmpState->imgH, static_cast<int>(y + h));
 			bool needRealloc = (bmpState->hBitmap == NULL) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
 
 			if (needRealloc) {
-				EnterCriticalSection(&bmpState->cs);
-				HBITMAP oldBitmap = bmpState->hBitmap;
-				void* oldDibBits = bmpState->dibBits;
-
+				// Allocate new bitmap and framebuffer
 				BITMAPINFO bmi = { 0 };
 				bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 				bmi.bmiHeader.biWidth = needW;
@@ -1085,27 +1085,24 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				HBITMAP newBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &newDibBits, NULL, 0);
 
 				if (!newBitmap || !newDibBits) {
-					LeaveCriticalSection(&bmpState->cs);
 					debug_log("CreateDIBSection failed (w=%d h=%d)\n", needW, needH);
+					LeaveCriticalSection(&bmpState->cs);
 					free(decoded);
-					goto END;
+					running = false;
+					break;
 				}
 
+				if (bmpState->hBitmap) DeleteObject(bmpState->hBitmap);
 				bmpState->hBitmap = newBitmap;
 				bmpState->dibBits = newDibBits;
 				bmpState->imgW = needW;
 				bmpState->imgH = needH;
-				bmpState->framebuffer.assign(bmpState->imgW * bmpState->imgH * 4, 0);
+				bmpState->framebuffer.assign(needW * needH * 4, 0xCC); // magenta for debug
 
-				if (oldBitmap) DeleteObject(oldBitmap);
-
-				PostMessage(hwnd, WM_USER + 1, MAKELPARAM(bmpState->imgW, bmpState->imgH), (LPARAM)bmpState->hBitmap);
-				debug_log("Allocated new bitmap (%d x %d)\n", bmpState->imgW, bmpState->imgH);
-				LeaveCriticalSection(&bmpState->cs);
+				debug_log("Allocated new bitmap (%d x %d)\n", needW, needH);
 			}
 
 			// Patch decoded region into framebuffer (with bounds check)
-			EnterCriticalSection(&bmpState->cs);
 			for (uint32_t row = 0; row < h; ++row) {
 				if ((y + row) >= (uint32_t)bmpState->imgH || x >= (uint32_t)bmpState->imgW) continue;
 				uint8_t* dst = &bmpState->framebuffer[((y + row) * bmpState->imgW + x) * 4];
@@ -1115,19 +1112,20 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 					(dst >= bmpState->framebuffer.data()) &&
 					(dst + copyBytes <= bmpState->framebuffer.data() + bmpState->framebuffer.size())) {
 					for (uint32_t col = 0; col < copyBytes; col += 4) {
-						dst[col + 0] = src[col + 2]; // B
-						dst[col + 1] = src[col + 1]; // G
-						dst[col + 2] = src[col + 0]; // R
-						dst[col + 3] = src[col + 3]; // A
+						dst[col + 0] = src[col + 2];
+						dst[col + 1] = src[col + 1];
+						dst[col + 2] = src[col + 0];
+						dst[col + 3] = src[col + 3];
 					}
 				}
 			}
+			// Always update the DIBSection after framebuffer update
 			size_t needBytes = (size_t)bmpState->imgW * bmpState->imgH * 4;
 			if (bmpState->hBitmap && bmpState->dibBits && bmpState->framebuffer.size() == needBytes) {
 				memcpy(bmpState->dibBits, bmpState->framebuffer.data(), needBytes);
 			}
-			LeaveCriticalSection(&bmpState->cs);
 
+			LeaveCriticalSection(&bmpState->cs);
 			free(decoded);
 
 			InvalidateRect(hwnd, NULL, FALSE);
@@ -1152,14 +1150,6 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			lastSec = now;
 		}
 	}
-END:
-	debug_log("ScreenRecvThread exiting\n");
-	if (bmpState) {
-		delete bmpState;
-		SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
-	}
-	PostMessage(hwnd, WM_CLOSE, 0, 0);
-	closesocket(skt);
 }
 
 
