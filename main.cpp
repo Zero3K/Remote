@@ -220,7 +220,15 @@ HBITMAP CaptureScreenBitmap(int& width, int& height) {
 	HDC hMemDC = CreateCompatibleDC(hScreenDC);
 	width = GetSystemMetrics(SM_CXSCREEN);
 	height = GetSystemMetrics(SM_CYSCREEN);
-	HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, width, height);
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = width;
+	bmi.bmiHeader.biHeight = -height; // Top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	void* pBits = NULL;
+	HBITMAP hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
 	HGDIOBJ oldObj = SelectObject(hMemDC, hBitmap);
 	BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY);
 	SelectObject(hMemDC, oldObj);
@@ -731,22 +739,36 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		int destW = clientRect.right - clientRect.left;
 		int destH = clientRect.bottom - clientRect.top;
 
-		// Double-buffered drawing
-		HDC hdcMem = CreateCompatibleDC(hdc);
-		HBITMAP hbmMem = CreateCompatibleBitmap(hdc, destW, destH);
-		HGDIOBJ oldMemBmp = SelectObject(hdcMem, hbmMem);
+		static HBITMAP hDoubleBufBmp = NULL;
+		static void* pDoubleBufBits = NULL;
+		static int doubleBufW = 0, doubleBufH = 0;
 
-		// Fill double buffer with black
+		// (Re)create double-buffer DIBSection if size changed
+		if (!hDoubleBufBmp || doubleBufW != destW || doubleBufH != destH) {
+			if (hDoubleBufBmp) DeleteObject(hDoubleBufBmp);
+			BITMAPINFO bmi = { 0 };
+			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+			bmi.bmiHeader.biWidth = destW;
+			bmi.bmiHeader.biHeight = -destH; // top-down
+			bmi.bmiHeader.biPlanes = 1;
+			bmi.bmiHeader.biBitCount = 32;
+			bmi.bmiHeader.biCompression = BI_RGB;
+			hDoubleBufBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pDoubleBufBits, NULL, 0);
+			doubleBufW = destW;
+			doubleBufH = destH;
+		}
+
+		HDC hdcBuf = CreateCompatibleDC(hdc);
+		HGDIOBJ oldBufBmp = SelectObject(hdcBuf, hDoubleBufBmp);
+
+		// Fill with black for letterboxing/pillarboxing
 		HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
-		FillRect(hdcMem, &clientRect, brush);
+		FillRect(hdcBuf, &clientRect, brush);
 		DeleteObject(brush);
 
 		if (hBitmap) {
-			HDC hMem = CreateCompatibleDC(hdcMem);
-			HGDIOBJ oldObj = SelectObject(hMem, hBitmap);
 			BITMAP bm;
 			GetObject(hBitmap, sizeof(bm), &bm);
-
 			int srcW = bm.bmWidth;
 			int srcH = bm.bmHeight;
 
@@ -768,23 +790,31 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				offsetY = (destH - drawH) / 2;
 			}
 
-			StretchBlt(hdcMem, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+			HDC hMem = CreateCompatibleDC(hdcBuf);
+			HGDIOBJ oldObj = SelectObject(hMem, hBitmap);
+
+			if (drawW == srcW && drawH == srcH) {
+				// 1:1 copy, sharpest
+				BitBlt(hdcBuf, offsetX, offsetY, srcW, srcH, hMem, 0, 0, SRCCOPY);
+			}
+			else {
+				SetStretchBltMode(hdcBuf, COLORONCOLOR);
+				StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+			}
 
 			SelectObject(hMem, oldObj);
 			DeleteDC(hMem);
 		}
 
-		// Blit double buffer to screen
-		BitBlt(hdc, 0, 0, destW, destH, hdcMem, 0, 0, SRCCOPY);
+		// Copy double buffer to screen
+		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
 
-		// Cleanup
-		SelectObject(hdcMem, oldMemBmp);
-		DeleteObject(hbmMem);
-		DeleteDC(hdcMem);
+		SelectObject(hdcBuf, oldBufBmp);
+		DeleteDC(hdcBuf);
 
 		EndPaint(hwnd, &ps);
 		break;
-	}	
+	}
 	
 	case WM_DESTROY:
 		if (hBitmap) DeleteObject(hBitmap);
