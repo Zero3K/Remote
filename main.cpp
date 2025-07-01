@@ -642,6 +642,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	std::vector<uint32_t> curr_pixels;
 
 	bool first = true;
+	static int frameCounter = 0;  // <- Add static frame counter
 
 	auto lastPrint = steady_clock::now();
 	int frames = 0;
@@ -666,7 +667,11 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 
 		// --- DIRTY TILE: Compare prev and curr, send dirty tiles ---
 		std::vector<DirtyTile> DirtyTiles;
-		if (first) {
+
+		frameCounter++;
+		// Force full frame on first frame and every 60 frames (approx every 2-3s at 20-30fps)
+		if (first || frameCounter % 60 == 0) {
+			DirtyTiles.clear();
 			DirtyTiles.push_back({ 0, 0, imgW, imgH });
 			prev_rgba = curr_rgba;
 			prev_pixels = curr_pixels;
@@ -1030,6 +1035,9 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 
 		size_t bytesThisFrame = 4; // nTiles field
 		bool frame_error = false;
+		bool fullScreenInvalidation = false;
+
+		std::vector<RECT> invalidateRects; // Store per-tile rects
 
 		for (uint32_t i = 0; i < nTiles; ++i) {
 			uint32_t x, y, w, h, qoiLen;
@@ -1133,10 +1141,32 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				memcpy(bmpState->dibBits, bmpState->framebuffer.data(), needBytes);
 			}
 
+			// --- Per-tile/fullscreen InvalidateRect logic ---
+			if (x == 0 && y == 0 && w == (uint32_t)bmpState->imgW && h == (uint32_t)bmpState->imgH) {
+				// This is a full-screen update, so mark for full-window invalidation (once per frame)
+				fullScreenInvalidation = true;
+			}
+			else {
+				RECT tileRect;
+				tileRect.left = x;
+				tileRect.top = y;
+				tileRect.right = x + w;
+				tileRect.bottom = y + h;
+				invalidateRects.push_back(tileRect);
+			}
+
 			LeaveCriticalSection(&bmpState->cs);
 			free(decoded);
+		}
 
+		// Invalidate all changed tiles (outside the lock)
+		if (fullScreenInvalidation) {
 			InvalidateRect(hwnd, NULL, FALSE);
+		}
+		else {
+			for (const RECT& r : invalidateRects) {
+				InvalidateRect(hwnd, &r, FALSE);
+			}
 		}
 
 		if (frame_error) break;
