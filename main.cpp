@@ -26,6 +26,7 @@
 #include <iphlpapi.h>
 #pragma comment(lib, "Ws2_32.lib")
 
+
 class MainWindow; // forward declaration, so 'extern MainWindow* ...' is legal
 extern MainWindow* g_pMainWindow;
 
@@ -156,11 +157,14 @@ extern std::atomic<int> g_screenStreamFPS;
 extern std::atomic<int> g_screenStreamW;
 extern std::atomic<int> g_screenStreamH;
 
-// Streaming server/client declarations (implementations in another file)
+// Streaming server/client declarations
 void ScreenStreamServerThread(SOCKET sktClient);
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip);
 void StartScreenRecv(std::string server_ip, int port);
+
+void ServerInputRecvThread(SOCKET clientSocket);
+
 
 
 // ================================================
@@ -880,120 +884,44 @@ void StartScreenRecv(std::string server_ip, int port) {
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
-	{
-
+    {
 	case WM_CREATE:
-		return HandleCreate(uMsg, wParam, lParam);
-
+		 return HandleCreate(uMsg, wParam, lParam);
 	case WM_INPUT:
-		RetrieveInput(uMsg, wParam, lParam);
-		return 0;
-
-	case WM_PAINT:
-		return HandlePaint(uMsg, wParam, lParam);
-
-	case WM_COMMAND:
-		return HandleCommand(uMsg, wParam, lParam);
-
-	case WM_CLOSE:
-		return HandleClose(uMsg, wParam, lParam);
-
-	case WM_DESTROY:
-		PostQuitMessage(0);
-		return 0;
-
-	default:
-		return DefWindowProc(m_hwnd, uMsg, wParam, lParam);
-	}
-	return TRUE;
-}
-int MainWindow::RetrieveInput(UINT uMsg, WPARAM wParam, LPARAM lParam)
-{
-	if (Data.nMode == MODE::SERVER)
-	{
+		// CLIENT mode: capture input, send to server
+		if (Data.nMode == MODE::CLIENT && Client.isConnected) {
 		unsigned int dwSize;
-		// get the size of the input data
-		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER)) == -1) {
-			return 1;
-		}
-
-		// allocate enough space to store the raw input data
-		LPBYTE lpb = nullptr;
-		lpb = new unsigned char[dwSize];
-
-		if (lpb == nullptr) {
-			return 1;
-		}
-
-		// get the raw input data
+		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER)) == -1) break;
+		LPBYTE lpb = new unsigned char[dwSize];
+		if (!lpb) break;
 		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
-			delete[] lpb;
-			return 1;
+		delete[] lpb; break;
 		}
-
-		ConvertInput((PRAWINPUT)lpb, &Server.inputBuff);
-		delete[] lpb;
-
-
-		// This block is responsible for sending the input to the other computer if 
-		// the mouse cursor reaches the right edge of the screen
-		// at which point, the cursor on the server computer becomes "frozen" until 
-		// the cursor on the other computer reaches the left side of its screen
-		if (Server.inputBuff.type == 0 && !Server.bOnOtherScreen && Server.nConnected > 0)
-		{
-			if (!GetCursorPos(&Server.mPos))
-			{
-				Log("Unable to retrieve absolute position of cursor");
-			}
-			else
-			{
-				if (Server.mPos.x >= nScreenWidth[0] - 1)
-				{
-					Server.inputBuff.mi.dwFlags = Server.inputBuff.mi.dwFlags | MOUSEEVENTF_ABSOLUTE;
-					Server.inputBuff.mi.dx = 0;
-					Server.inputBuff.mi.dy = ((float)Server.mPos.y / (float)nScreenHeight[0]) * nNormalized;
-					Server.oldX = Server.mPos.x;
-					Server.oldY = Server.mPos.y;
-					Server.bPause = false;
-					Server.bOnOtherScreen = true;
-				}
-			}
+		INPUT inputBuff;
+		ConvertInput((PRAWINPUT)lpb, &inputBuff);
+	    delete[] lpb;
+		
+		// Send to server
+		send(Client.sktServer, (char*)&inputBuff, sizeof(INPUT), 0);
 		}
-		else if (Server.bOnOtherScreen && Server.nConnected > 0)
-		{
-			short newOffsetX = Server.nOffsetX + Server.inputBuff.mi.dx;
-
-			Server.nOffsetX += Server.inputBuff.mi.dx;
-
-			if (Server.nOffsetX > nScreenHeight[1]) Server.nOffsetX = nScreenHeight[1];
-
-			//d.nOffsetY += Server.inputBuff.mi.dy;
-			GetCursorPos(&Server.mPos);
-			SetCursorPos(nScreenWidth[0] - 2, Server.mPos.y);
-
-			if (Server.nOffsetX < 0)
-			{
-				Server.bPause = true;
-				Server.bOnOtherScreen = false;
-			}
-
-		}
-		else if (Server.nConnected <= 0 && Server.bOnOtherScreen)
-		{
-			Server.nOffsetX = -1;
-			Server.bOnOtherScreen = false;
-		}
-		if (!Server.bPause)
-		{
-			//std::unique_lock<std::mutex> lock(Server.mu_input);
-			Server.inputQueue.push(Server.inputBuff);
-			Server.cond_input.notify_all();
-		}
-
-		UpdateInput();
+		return 0;
+	 case WM_PAINT:
+		 return HandlePaint(uMsg, wParam, lParam);
+	case WM_COMMAND:
+		 return HandleCommand(uMsg, wParam, lParam);
+	case WM_CLOSE:
+		 return HandleClose(uMsg, wParam, lParam);
+	case WM_DESTROY:
+		 PostQuitMessage(0);
+		 return 0;
+	default:
+		 return DefWindowProc(m_hwnd, uMsg, wParam, lParam);
+		 }
+	return TRUE;
 	}
-	return 0;
-}
+
+// Removed RetrieveInput logic (no longer used on server)
+
 int MainWindow::HandleCommand(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (HIWORD(wParam)) {
@@ -1652,10 +1580,6 @@ int MainWindow::ServerStart()
 		Log("Starting listening thread");
 		Server.tListen = std::thread(&MainWindow::ListenThread, this);
 
-		// start sending input thread
-		Log("Starting sending thread");
-		Server.tSend = std::thread(&MainWindow::SendThread, this);
-
 		// SCREEN STREAM: Start a screen stream server socket on SCREEN_STREAM_PORT
 		SOCKET* sktScreenListenPtr = new SOCKET(INVALID_SOCKET);
 		if (InitializeScreenStreamServer(*sktScreenListenPtr, SCREEN_STREAM_PORT) == 0) {
@@ -1678,7 +1602,6 @@ int MainWindow::ServerStart()
 			Log("Could not start screen streaming server");
 		}
 		Server.tListen.detach();
-		Server.tSend.detach();
 	}
 	return 0;
 }
@@ -1775,90 +1698,68 @@ int MainWindow::ClientDisconnect()
 }
 
 int MainWindow::ListenThread()
-  {
+ {
 	bool socket_found = false;
 	int index = 0;
 	while (Server.isOnline && Data.nMode == MODE::SERVER)
-	{
+		 {
 		std::unique_lock<std::mutex> lock(Server.mu_sktclient);
 		if (Server.nConnected >= Server.maxClients)
-		{
+			 {
 			Server.cond_listen.wait(lock);
-		}
+			}
 		if (!socket_found) {
 			for (int i = 0; i < Server.ClientsInformation.size(); i++)
-			{
-				if (Server.ClientsInformation[i].socket == INVALID_SOCKET)
 				{
+				if (Server.ClientsInformation[i].socket == INVALID_SOCKET)
+					 {
 					socket_found = true;
 					index = i;
-				}
+					}
+				 }
 			}
-		}
 		lock.unlock();
 		if (listen(Server.sktListen, 1) == SOCKET_ERROR) {
 			Log("Listen failed with error: " + std::to_string(WSAGetLastError()));
-		}
-		sockaddr* inc_conn = new sockaddr;
+			}
+		sockaddr * inc_conn = new sockaddr;
 		int sosize = sizeof(sockaddr);
 		Server.ClientsInformation[index].socket = accept(Server.sktListen, inc_conn, &sosize);
 		if (Server.ClientsInformation[index].socket == INVALID_SOCKET)
-		{
+			{
 			Log("accept failed: " + std::to_string(WSAGetLastError()));
-		}
+			}
 		else
-		{
+			{
 			Log("Connection accepted");
 			Server.nConnected++;
+            // Start input receive/inject thread per client
+			std::thread(ServerInputRecvThread, Server.ClientsInformation[index].socket).detach();
 			socket_found = false;
-		}
-		delete inc_conn;
-
-	}
+			}
+		 delete inc_conn;
+		 }
 	Log("Listen thread - ended");
 	return 0;
-}
-int MainWindow::SendThread()
-{
-	 while (Server.isOnline && Data.nMode == MODE::SERVER)
-		 {
-		 std::unique_lock<std::mutex> lock(Server.mu_input);
-		 if (Server.inputQueue.empty())
-			{
-			 Server.cond_input.wait(lock);
-			}
-		 else
-		 {
-			 INPUT inputData = Server.inputQueue.front();
-			 int bytes = 0;
-			 for (auto& client : Server.ClientsInformation)
-				  {
-				 //std::cout << "Searching for client" << std::endl;
-				 if (client.socket != INVALID_SOCKET)
-					  {
-					 //std::cout << "Sending..." << std::endl;
-					bytes = send(client.socket, (char*)&inputData, sizeof(INPUT), 0);
-					
-					if (bytes == SOCKET_ERROR)
-					 {
-						// client disconnected
-						Log("Client nb " + std::to_string(client.id) + " disconnected: " + std::to_string(client.socket) + "\nIP: " + client.ip);
-						Server.nConnected--;
-						closesocket(client.socket);
-						client.socket = INVALID_SOCKET;
-						client.id = -1;
-						client.ip = "";
-						Server.cond_listen.notify_all();
-						}
-					 }
-				 }
-			 //lock.lock();
-			Server.inputQueue.pop();
-			}
-		}
-	   Log("Sending thread - ended");
-	 return 0;
 	}
+
+// Removed SendThread logic (no longer needed on server)
+ 
+// --- Add server-side input receiving and injection thread ---
+
+// New function: receive INPUT structs from each client and inject locally
+
+void ServerInputRecvThread(SOCKET clientSocket) {
+	while (true) {
+		 INPUT input;
+		 int received = recv(clientSocket, (char*)&input, sizeof(INPUT), 0);
+		 if (received <= 0) break;
+		 SendInput(1, &input, sizeof(INPUT));
+	}
+	  closesocket(clientSocket);
+	
+}
+
 int MainWindow::ReceiveThread()
 {
 	while (Client.isConnected && Data.nMode == MODE::CLIENT)
