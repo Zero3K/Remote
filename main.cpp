@@ -642,7 +642,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	std::vector<uint32_t> curr_pixels;
 
 	bool first = true;
-	static int frameCounter = 0;  // <- Add static frame counter
+	static int frameCounter = 0;  // Frame counter for periodic full frame
 
 	auto lastPrint = steady_clock::now();
 	int frames = 0;
@@ -679,6 +679,15 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		}
 		else {
 			detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), imgW, imgH, DirtyTiles);
+
+			// --- NEW: If too many dirty tiles, force full frame ---
+			size_t totalTiles = ((imgW + TILE_W - 1) / TILE_W) * ((imgH + TILE_H - 1) / TILE_H);
+			if (DirtyTiles.size() > totalTiles * 0.3) { // If more than 30% of the screen is dirty, force full frame
+				DirtyTiles.clear();
+				DirtyTiles.push_back({ 0, 0, imgW, imgH });
+				prev_rgba = curr_rgba;
+				prev_pixels = curr_pixels;
+			}
 		}
 
 		// Send number of dirty tiles as uint32_t
