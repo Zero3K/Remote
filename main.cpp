@@ -628,12 +628,6 @@ int CloseConnection(SOCKET* sktConn) {
 
 // =================== SCREEN STREAM SERVER =====================
 
-std::atomic<bool> g_screenStreamActive(false);
-std::atomic<size_t> g_screenStreamBytes(0);
-std::atomic<int> g_screenStreamFPS(0);
-std::atomic<int> g_screenStreamW(0);
-std::atomic<int> g_screenStreamH(0);
-
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 	int width = 0, height = 0;
@@ -812,11 +806,14 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		case IDM_VIDEO_FPS_40: SetRemoteScreenFps(hwnd, 40); break;
 		case IDM_VIDEO_FPS_60: SetRemoteScreenFps(hwnd, 60); break;
 			// Always On Top
-		case IDM_ALWAYS_ON_TOP:
+		extern MainWindow* g_pMainWindow;
+        case IDM_ALWAYS_ON_TOP:
 			g_alwaysOnTop = !g_alwaysOnTop;
-			m_savedAlwaysOnTop = g_alwaysOnTop;
+			if (g_pMainWindow) {
+				g_pMainWindow->m_savedAlwaysOnTop = g_alwaysOnTop;
+				g_pMainWindow->SaveConfig();
+			}
 			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-			SaveConfig();
 			break;
 			// Send Keys
 		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
@@ -2524,6 +2521,7 @@ int MainWindow::ReceiveThread()
 		 f.close();
 		 return true;
 	 }
+
 	 // --- LoadConfig: now loads FPS, AlwaysOnTop, and window size ---
 	 bool MainWindow::LoadConfig()
 	 {
@@ -2599,32 +2597,42 @@ int MainWindow::ReceiveThread()
 	 }
 
 
-int main()
-{
-	// ---- Ensure WSAStartup is called ONCE here ----
-	WSADATA wsadata;
-	int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
-	if (wsaResult != 0) {
-		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
-		return 1;
-	}
-	MainWindow win;
-	g_pMainWindow = &win; // <-- Set the global pointer after win is defined
-	if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, 477, 340, NULL))
-	{
-		std::cout << "error creating the main window: " << GetLastError() << std::endl;
-		WSACleanup();
-		return 0;
-	}
 
-	ShowWindow(win.Window(), 1);
+	 int main()
+	 {
+		 // ---- Ensure WSAStartup is called ONCE here ----
+		 WSADATA wsadata;
+		 int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
+		 if (wsaResult != 0) {
+			 std::cout << "WSAStartup failed: " << wsaResult << std::endl;
+			 return 1;
+		 }
+		 MainWindow win;
+		 g_pMainWindow = &win; // <-- Set the global pointer after win is defined
 
-	MSG msg = { };
-	while (GetMessage(&msg, NULL, 0, 0))
-	{
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
-	}
-	WSACleanup();
-	return 0;
-}
+		 // Use loaded size from config
+		 int winW = win.m_savedWinW;
+		 int winH = win.m_savedWinH;
+		 if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL))
+		 {
+			 std::cout << "error creating the main window: " << GetLastError() << std::endl;
+			 WSACleanup();
+			 return 0;
+		 }
+
+		 // Set Always On Top on restore
+		 if (win.m_savedAlwaysOnTop) {
+			 SetWindowPos(win.Window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+		 }
+
+		 ShowWindow(win.Window(), 1);
+
+		 MSG msg = { };
+		 while (GetMessage(&msg, NULL, 0, 0))
+		 {
+			 TranslateMessage(&msg);
+			 DispatchMessage(&msg);
+		 }
+		 WSACleanup();
+		 return 0;
+	 }
