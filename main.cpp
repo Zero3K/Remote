@@ -13,6 +13,7 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 
 #include <Windows.h>
 #include <windowsx.h>
@@ -26,6 +27,15 @@
 #include <iphlpapi.h>
 #pragma comment(lib, "Ws2_32.lib")
 
+enum class RemoteCtrlType : uint8_t {
+	SetQuality = 1,
+	SetFps = 2
+};
+#pragma pack(push, 1)
+struct RemoteCtrlMsg {
+	RemoteCtrlType type;
+	uint8_t value; // quality: [1-4], fps: [5,10,20,30,40,60]
+};
 
 class MainWindow; // forward declaration, so 'extern MainWindow* ...' is legal
 extern MainWindow* g_pMainWindow;
@@ -125,19 +135,28 @@ HMENU CreateScreenContextMenu() {
 // These are called from the context menu handler.
 
 void SetRemoteScreenQuality(HWND hwnd, int qualityLevel) {
-	// Translate level 1-4 to actual JPEG quality (20, 40, 60, 80)
 	static const int levels[] = { 0, 20, 40, 60, 80 };
 	g_screenStreamMenuQuality = qualityLevel;
 	g_screenStreamActualQuality = levels[qualityLevel];
-	// Send a custom message to the server streaming thread if needed
-	// This is a simple way: store the value in a global variable
-	// If you have a streaming thread object, signal it to update quality
+
+	// Find the input socket for this window
+	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+	if (!psktInput || *psktInput == INVALID_SOCKET) return;
+
+	// Send control message to server
+	RemoteCtrlMsg msg = { RemoteCtrlType::SetQuality, (uint8_t)qualityLevel };
+	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
 }
 
 void SetRemoteScreenFps(HWND hwnd, int fps) {
 	g_screenStreamMenuFps = fps;
 	g_screenStreamActualFps = fps;
-	// Again: signal streaming thread to update FPS if needed
+
+	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+	if (!psktInput || *psktInput == INVALID_SOCKET) return;
+
+	RemoteCtrlMsg msg = { RemoteCtrlType::SetFps, (uint8_t)fps };
+	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
 }
 
 // This helper sends special key combos to the remote side
@@ -484,64 +503,65 @@ std::atomic<int> g_screenStreamW(0);
 std::atomic<int> g_screenStreamH(0);
 
 void ScreenStreamServerThread(SOCKET sktClient) {
-	using namespace std::chrono;
-	int width = 0, height = 0;
-	int fps = g_screenStreamActualFps;
-	int quality = g_screenStreamActualQuality;
-	int frameInterval = 1000 / fps;
+    using namespace std::chrono;
+    int width = 0, height = 0;
+    int fps = g_screenStreamActualFps;
+    int quality = g_screenStreamActualQuality;
+    int frameInterval = 1000 / fps;
 
-	g_screenStreamActive = true;
-	g_screenStreamBytes = 0;
-	g_screenStreamFPS = 0;
+    g_screenStreamActive = true;
+    g_screenStreamBytes = 0;
+    g_screenStreamFPS = 0;
 
-	auto lastPrint = steady_clock::now();
-	int frames = 0;
-	size_t bytes = 0;
+    auto lastPrint = steady_clock::now();
+    int frames = 0;
+    size_t bytes = 0;
 
-	while (g_screenStreamActive) {
-		fps = g_screenStreamActualFps;
-		quality = g_screenStreamActualQuality;
-		frameInterval = 1000 / fps;
+    while (g_screenStreamActive) {
+        fps = g_screenStreamActualFps;
+        quality = g_screenStreamActualQuality;
+        frameInterval = 1000 / fps;
 
-		auto start = steady_clock::now();
-		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
-		std::vector<BYTE> jpgBuffer;
-		if (!BitmapToJPEGBuffer(hBitmap, jpgBuffer, quality)) {
-			DeleteObject(hBitmap);
-			continue;
-		}
-		DeleteObject(hBitmap);
-		uint32_t sz = jpgBuffer.size();
-		uint32_t szNet = htonl(sz);
+        auto start = steady_clock::now();
+        HBITMAP hBitmap = CaptureScreenBitmap(width, height);
+        std::vector<BYTE> jpgBuffer;
+        if (!BitmapToJPEGBuffer(hBitmap, jpgBuffer, quality)) {
+            DeleteObject(hBitmap);
+            continue;
+        }
+        DeleteObject(hBitmap);
+        uint32_t sz = jpgBuffer.size();
+        uint32_t szNet = htonl(sz);
 
-		int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
-		if (ret != sizeof(szNet)) break;
-		size_t offset = 0;
-		while (offset < sz) {
-			int sent = send(sktClient, (const char*)(jpgBuffer.data() + offset), sz - offset, 0);
-			if (sent <= 0) goto END;
-			offset += sent;
-		}
-		frames++;
-		bytes += sz + sizeof(szNet);
-		g_screenStreamW = width;
-		g_screenStreamH = height;
+        int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
+        if (ret != sizeof(szNet)) break;
+        size_t offset = 0;
+        while (offset < sz) {
+            int sent = send(sktClient, (const char*)(jpgBuffer.data() + offset), sz - offset, 0);
+            if (sent <= 0) goto END;
+            offset += sent;
+        }
+        frames++;
+        bytes += sz + sizeof(szNet);
+        g_screenStreamW = width;
+        g_screenStreamH = height;
 
-		auto now = steady_clock::now();
-		if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
-			g_screenStreamFPS = frames;
-			g_screenStreamBytes = bytes;
-			frames = 0;
-			bytes = 0;
-			lastPrint = now;
-		}
-		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
-		if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
-	}
+        auto now = steady_clock::now();
+        if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
+            g_screenStreamFPS = frames;
+            g_screenStreamBytes = bytes;
+            frames = 0;
+            bytes = 0;
+            lastPrint = now;
+        }
+        auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
+        if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
+    }
 END:
-	closesocket(sktClient);
-	g_screenStreamActive = false;
+    closesocket(sktClient);
+    g_screenStreamActive = false;
 }
+
 
 
 // ============ SCREEN STREAM CLIENT WINDOW ============
@@ -1935,13 +1955,36 @@ int MainWindow::ListenThread()
 
 void ServerInputRecvThread(SOCKET clientSocket) {
 	while (true) {
-		 INPUT input;
-		 int received = recv(clientSocket, (char*)&input, sizeof(INPUT), 0);
-		 if (received <= 0) break;
-		 SendInput(1, &input, sizeof(INPUT));
+		char buffer[sizeof(INPUT) > sizeof(RemoteCtrlMsg) ? sizeof(INPUT) : sizeof(RemoteCtrlMsg)];
+		int received = recv(clientSocket, buffer, sizeof(buffer), 0);
+		if (received <= 0) break;
+
+		if (received == sizeof(RemoteCtrlMsg)) {
+			// Handle control messages from client
+			RemoteCtrlMsg* msg = (RemoteCtrlMsg*)buffer;
+			if (msg->type == RemoteCtrlType::SetQuality) {
+				static const int levels[] = { 0, 20, 40, 60, 80 };
+				int q = msg->value;
+				if (q >= 1 && q <= 4) {
+					g_screenStreamActualQuality = levels[q];
+					std::cout << "Set streaming quality to level " << q << " (" << levels[q] << ")\n";
+				}
+			}
+			else if (msg->type == RemoteCtrlType::SetFps) {
+				int fps = msg->value;
+				if (fps == 5 || fps == 10 || fps == 20 || fps == 30 || fps == 40 || fps == 60) {
+					g_screenStreamActualFps = fps;
+					std::cout << "Set streaming FPS to " << fps << "\n";
+				}
+			}
+			continue;
+		}
+
+		if (received == sizeof(INPUT)) {
+			SendInput(1, (INPUT*)buffer, sizeof(INPUT));
+		}
 	}
-	  closesocket(clientSocket);
-	
+	closesocket(clientSocket);
 }
 
 int MainWindow::ReceiveThread()
