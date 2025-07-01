@@ -26,8 +26,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
-#include <set> // DIRTY RECT
-#include <algorithm> // DIRTY RECT
+#include <set> // DIRTY TILE
+#include <algorithm> // DIRTY TILE
 #pragma comment(lib, "Ws2_32.lib")
 
 enum class RemoteCtrlType : uint8_t {
@@ -40,16 +40,15 @@ struct RemoteCtrlMsg {
 	uint8_t value; // quality: [1-4], fps: [5,10,20,30,40,60]
 };
 
-// --- DIRTY RECTANGLE STRUCT ---
-struct DirtyRect {
+// --- DIRTY TILE STRUCT ---
+// Replace this struct with your existing one if it differs
+struct DirtyTile {
 	int left, top, right, bottom;
-	bool operator<(const DirtyRect& other) const {
-		if (top != other.top) return top < other.top;
-		if (left != other.left) return left < other.left;
-		if (right != other.right) return right < other.right;
-		return bottom < other.bottom;
-	}
 };
+
+constexpr int TILE_W = 32;
+constexpr int TILE_H = 32;
+
 
 // Define per-window state struct (can be in a header)
 struct ScreenBitmapState {
@@ -71,37 +70,40 @@ struct ScreenBitmapState {
 		DeleteCriticalSection(&cs);
 	}
 };/**
- * Compare two 32bpp RGBA framebuffers and collect dirty rectangles.
- * A simple line-by-line approach: every run of changed pixels on a scanline is a rect.
- * Optionally, you could merge rectangles for better packing.
+/**
+ * Compare two 32bpp RGBA framebuffers and collect dirty tiles.
+ * A simple line-by-line approach: every run of changed pixels on a scanline is a tile.
  */
-void detect_dirty_rects(
+void detect_dirty_tiles(
 	const uint32_t* prev, const uint32_t* curr, int width, int height,
-	std::vector<DirtyRect>& out_rects
+	std::vector<DirtyTile>& out_tiles
 ) {
-	out_rects.clear();
-	for (int y = 0; y < height; ++y) {
-		int run_start = -1;
-		for (int x = 0; x < width; ++x) {
-			int idx = y * width + x;
-			if (prev[idx] != curr[idx]) {
-				if (run_start == -1) run_start = x;
-			}
-			else {
-				if (run_start != -1) {
-					out_rects.push_back({ run_start, y, x, y + 1 });
-					run_start = -1;
+	out_tiles.clear();
+	for (int ty = 0; ty < height; ty += TILE_H) {
+		int th = std::min(TILE_H, height - ty);
+		for (int tx = 0; tx < width; tx += TILE_W) {
+			int tw = std::min(TILE_W, width - tx);
+
+			bool dirty = false;
+			for (int y = 0; y < th && !dirty; ++y) {
+				const uint32_t* row_prev = prev + (ty + y) * width + tx;
+				const uint32_t* row_curr = curr + (ty + y) * width + tx;
+				for (int x = 0; x < tw; ++x) {
+					if (row_prev[x] != row_curr[x]) {
+						dirty = true;
+						break;
+					}
 				}
 			}
+			if (dirty) {
+				out_tiles.push_back({ tx, ty, tx + tw, ty + th });
+			}
 		}
-		if (run_start != -1)
-			out_rects.push_back({ run_start, y, width, y + 1 });
 	}
-	// Optionally merge adjacent rects here
 }
 
 // --- QOI utility for extracting subimages ---
-void extract_subimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyRect& r, std::vector<uint8_t>& out_rgba) {
+void extract_subimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& out_rgba) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
 	out_rgba.resize(rw * rh * 4);
 	for (int row = 0; row < rh; ++row) {
@@ -112,7 +114,7 @@ void extract_subimage(const std::vector<uint8_t>& rgba, int width, int height, c
 }
 
 // --- QOI encode a subimage ---
-bool QOIEncodeSubimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyRect& r, std::vector<uint8_t>& outQoi) {
+bool QOIEncodeSubimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& outQoi) {
 	std::vector<uint8_t> subimg;
 	extract_subimage(rgba, width, height, r, subimg);
 	qoi_desc desc;
@@ -662,25 +664,25 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		curr_pixels.resize(imgW * imgH);
 		memcpy(curr_pixels.data(), curr_rgba.data(), imgW * imgH * 4);
 
-		// --- DIRTY RECT: Compare prev and curr, send dirty rects ---
-		std::vector<DirtyRect> dirtyRects;
+		// --- DIRTY TILE: Compare prev and curr, send dirty tiles ---
+		std::vector<DirtyTile> DirtyTiles;
 		if (first) {
-			dirtyRects.push_back({ 0, 0, imgW, imgH });
+			DirtyTiles.push_back({ 0, 0, imgW, imgH });
 			prev_rgba = curr_rgba;
 			prev_pixels = curr_pixels;
 			first = false;
 		}
 		else {
-			detect_dirty_rects(prev_pixels.data(), curr_pixels.data(), imgW, imgH, dirtyRects);
+			detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), imgW, imgH, DirtyTiles);
 		}
 
-		// Send number of dirty rects as uint32_t
-		uint32_t nRects = (uint32_t)dirtyRects.size();
-		uint32_t nRectsNet = htonl(nRects);
-		int ret = send(sktClient, (const char*)&nRectsNet, sizeof(nRectsNet), 0);
-		if (ret != sizeof(nRectsNet)) break;
+		// Send number of dirty tiles as uint32_t
+		uint32_t nTiles = (uint32_t)DirtyTiles.size();
+		uint32_t nTilesNet = htonl(nTiles);
+		int ret = send(sktClient, (const char*)&nTilesNet, sizeof(nTilesNet), 0);
+		if (ret != sizeof(nTilesNet)) break;
 
-		for (const auto& r : dirtyRects) {
+		for (const auto& r : DirtyTiles) {
 			int rw = r.right - r.left, rh = r.bottom - r.top;
 			std::vector<uint8_t> qoiData;
 			QOIEncodeSubimage(curr_rgba, imgW, imgH, r, qoiData);
@@ -704,7 +706,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 				offset += sent;
 			}
 
-			bytes += qoiData.size() + 20; // 5 uint32_t fields per rect
+			bytes += qoiData.size() + 20; // 5 uint32_t fields per tile
 		}
 		prev_rgba = curr_rgba;
 		prev_pixels = curr_pixels;
@@ -1014,22 +1016,22 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 
 	bool running = true;
 	while (running) {
-		uint32_t nRectsNet = 0;
-		int ret = recv(skt, (char*)&nRectsNet, 4, MSG_WAITALL);
+		uint32_t nTilesNet = 0;
+		int ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
 		if (ret != 4) {
-			debug_log("Socket closed or error on rect count\n");
+			debug_log("Socket closed or error on tile count\n");
 			break;
 		}
-		uint32_t nRects = ntohl(nRectsNet);
-		if (nRects == 0) {
-			debug_log("Got nRects = 0 (keepalive?)\n");
+		uint32_t nTiles = ntohl(nTilesNet);
+		if (nTiles == 0) {
+			debug_log("Got nTiles = 0 (keepalive?)\n");
 			continue;
 		}
 
-		size_t bytesThisFrame = 4; // nRects field
+		size_t bytesThisFrame = 4; // nTiles field
 		bool frame_error = false;
 
-		for (uint32_t i = 0; i < nRects; ++i) {
+		for (uint32_t i = 0; i < nTiles; ++i) {
 			uint32_t x, y, w, h, qoiLen;
 			int got;
 
@@ -1043,7 +1045,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
 
 			if (w == 0 || h == 0 || qoiLen == 0) {
-				debug_log("Invalid rect: w=%u h=%u qoiLen=%u\n", w, h, qoiLen);
+				debug_log("Invalid tile: w=%u h=%u qoiLen=%u\n", w, h, qoiLen);
 				continue;
 			}
 
