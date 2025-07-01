@@ -1,3 +1,4 @@
+#define QOI_IMPLEMENTATION
 #define WIN32_LEAN_AND_MEAN
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #undef UNICODE
@@ -19,8 +20,7 @@
 #include <windowsx.h>
 
 #include <objidl.h>
-#include <gdiplus.h>
-#pragma comment (lib, "Gdiplus.lib")
+#include "qoi.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -66,6 +66,7 @@ extern MainWindow* g_pMainWindow;
 #define IDM_VIDEO_QUALITY_2   6003
 #define IDM_VIDEO_QUALITY_3   6004
 #define IDM_VIDEO_QUALITY_4   6005
+#define IDM_VIDEO_QUALITY_5   6006
 
 #define IDM_VIDEO_FPS         6010
 #define IDM_VIDEO_FPS_5       6011
@@ -82,6 +83,9 @@ extern MainWindow* g_pMainWindow;
 #define IDM_SENDKEYS_CTRLESC  6032
 #define IDM_SENDKEYS_CTRALTDEL 6033
 #define IDM_SENDKEYS_PRNTSCRN 6034
+
+std::atomic<int> g_streamingFps(SCREEN_STREAM_FPS);
+std::atomic<int> g_streamingQuality(SCREEN_STREAM_QUALITY);
 
 // --- State variables for menu ---
 static bool g_alwaysOnTop = false;
@@ -105,7 +109,8 @@ HMENU CreateScreenContextMenu() {
 	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 1 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_1, "1 (Low)");
 	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 2 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_2, "2");
 	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 3 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_3, "3");
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 4 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_4, "4 (High)");
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 4 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_4, "4");
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 5 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_5, "5 (High)");
 	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hQualityMenu, "Video Quality");
 
 	// Video FPS submenu
@@ -210,15 +215,6 @@ int nScreenHeight[2] = { 1080 , 1440 };
 
 const int nNormalized = 65535;
 
-// GDI+ helpers for screen streaming
-ULONG_PTR gdiplusToken;
-void InitGDIPlus() {
-	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-	Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-}
-void ShutdownGDIPlus() {
-	Gdiplus::GdiplusShutdown(gdiplusToken);
-}
 HBITMAP CaptureScreenBitmap(int& width, int& height) {
 	HDC hScreenDC = GetDC(NULL);
 	HDC hMemDC = CreateCompatibleDC(hScreenDC);
@@ -232,60 +228,88 @@ HBITMAP CaptureScreenBitmap(int& width, int& height) {
 	ReleaseDC(NULL, hScreenDC);
 	return hBitmap;
 }
-bool BitmapToJPEGBuffer(HBITMAP hBitmap, std::vector<BYTE>& outBuffer, int quality = 60) {
-	using namespace Gdiplus;
-	Bitmap bmp(hBitmap, NULL);
-	CLSID clsidEncoder;
-	UINT num = 0, size = 0;
-	GetImageEncodersSize(&num, &size);
-	if (size == 0) return false;
-	std::vector<BYTE> buffer(size);
-	ImageCodecInfo* pImageCodecInfo = (ImageCodecInfo*)buffer.data();
-	GetImageEncoders(num, size, pImageCodecInfo);
-	for (UINT j = 0; j < num; ++j) {
-		if (wcscmp(pImageCodecInfo[j].MimeType, L"image/jpeg") == 0) {
-			clsidEncoder = pImageCodecInfo[j].Clsid;
-			break;
-		}
+
+// Now, QOI expects raw RGBA data.
+// Helper to convert HBITMAP (24bpp or 32bpp) to 32bpp RGBA buffer.
+bool HBITMAPToRGBA(HBITMAP hBitmap, std::vector<uint8_t>& out, int& width, int& height) {
+	BITMAP bmp;
+	if (!hBitmap) return false;
+	if (!GetObject(hBitmap, sizeof(bmp), &bmp)) return false;
+	width = bmp.bmWidth;
+	height = bmp.bmHeight;
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = width;
+	bmi.bmiHeader.biHeight = -height; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	std::vector<uint8_t> tmp(width * height * 4);
+	HDC hdc = GetDC(NULL);
+	int res = GetDIBits(hdc, hBitmap, 0, height, tmp.data(), &bmi, DIB_RGB_COLORS);
+	ReleaseDC(NULL, hdc);
+	if (res == 0) return false;
+
+	// Convert BGRA to RGBA
+	out.resize(width * height * 4);
+	for (int i = 0; i < width * height; ++i) {
+		out[i * 4 + 0] = tmp[i * 4 + 2]; // R
+		out[i * 4 + 1] = tmp[i * 4 + 1]; // G
+		out[i * 4 + 2] = tmp[i * 4 + 0]; // B
+		out[i * 4 + 3] = 255;
 	}
-	IStream* istream = NULL;
-	CreateStreamOnHGlobal(NULL, TRUE, &istream);
-	EncoderParameters params;
-	params.Count = 1;
-	params.Parameter[0].Guid = EncoderQuality;
-	params.Parameter[0].Type = EncoderParameterValueTypeLong;
-	params.Parameter[0].NumberOfValues = 1;
-	ULONG q = quality;
-	params.Parameter[0].Value = &q;
-	if (bmp.Save(istream, &clsidEncoder, &params) == Ok) {
-		STATSTG stat;
-		istream->Stat(&stat, STATFLAG_NONAME);
-		DWORD bufSize = (DWORD)stat.cbSize.QuadPart;
-		outBuffer.resize(bufSize);
-		LARGE_INTEGER li = { 0 };
-		istream->Seek(li, STREAM_SEEK_SET, NULL);
-		ULONG read = 0;
-		istream->Read(outBuffer.data(), bufSize, &read);
-		istream->Release();
-		return true;
-	}
-	istream->Release();
-	return false;
+	return true;
 }
-HBITMAP JPEGBufferToBitmap(const BYTE* data, size_t len) {
-	using namespace Gdiplus;
-	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
-	memcpy(GlobalLock(hMem), data, len);
-	GlobalUnlock(hMem);
-	IStream* istream = NULL;
-	CreateStreamOnHGlobal(hMem, FALSE, &istream);
-	Bitmap* bmp = Bitmap::FromStream(istream, FALSE);
-	HBITMAP hBitmap = NULL;
-	bmp->GetHBITMAP(Gdiplus::Color(0, 0, 0), &hBitmap);
-	delete bmp;
-	istream->Release();
-	GlobalFree(hMem);
-	return hBitmap;
+
+// QOI encode
+bool BitmapToQOIBuffer(HBITMAP hBitmap, std::vector<uint8_t>& outBuffer, int& width, int& height) {
+	std::vector<uint8_t> rgba;
+	if (!HBITMAPToRGBA(hBitmap, rgba, width, height)) return false;
+	qoi_desc desc;
+	desc.width = width;
+	desc.height = height;
+	desc.channels = 4;
+	desc.colorspace = QOI_SRGB;
+	int out_len = 0;
+	void* qoi_data = qoi_encode(rgba.data(), &desc, &out_len);
+	if (!qoi_data) return false;
+	outBuffer.resize(out_len);
+	memcpy(outBuffer.data(), qoi_data, out_len);
+	free(qoi_data);
+	return true;
+}
+
+// QOI decode to HBITMAP
+HBITMAP QOIBufferToBitmap(const uint8_t* data, size_t len) {
+	int w, h;
+	qoi_desc desc;
+	void* decoded = qoi_decode(data, len, &desc, 4);
+	if (!decoded) return NULL;
+	w = desc.width;
+	h = desc.height;
+
+	// Allocate a 32bpp DIB section
+	BITMAPINFO bmi = { 0 };
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = w;
+	bmi.bmiHeader.biHeight = -h; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	HBITMAP hbm = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+	// Convert RGBA to BGRA
+	uint8_t* src = (uint8_t*)decoded;
+	uint8_t* dst = (uint8_t*)bits;
+	for (int i = 0; i < w * h; ++i) {
+		dst[i * 4 + 0] = src[i * 4 + 2]; // B
+		dst[i * 4 + 1] = src[i * 4 + 1]; // G
+		dst[i * 4 + 2] = src[i * 4 + 0]; // R
+		dst[i * 4 + 3] = 255;
+	}
+	free(decoded);
+	return hbm;
 }
 
 // SOCKETS function declarations for use in other translation units
@@ -503,64 +527,63 @@ std::atomic<int> g_screenStreamW(0);
 std::atomic<int> g_screenStreamH(0);
 
 void ScreenStreamServerThread(SOCKET sktClient) {
-    using namespace std::chrono;
-    int width = 0, height = 0;
-    int fps = g_screenStreamActualFps;
-    int quality = g_screenStreamActualQuality;
-    int frameInterval = 1000 / fps;
+	using namespace std::chrono;
+	int width = 0, height = 0;
 
-    g_screenStreamActive = true;
-    g_screenStreamBytes = 0;
-    g_screenStreamFPS = 0;
+	g_screenStreamActive = true;
+	g_screenStreamBytes = 0;
+	g_screenStreamFPS = 0;
 
-    auto lastPrint = steady_clock::now();
-    int frames = 0;
-    size_t bytes = 0;
+	auto lastPrint = steady_clock::now();
+	int frames = 0;
+	size_t bytes = 0;
 
-    while (g_screenStreamActive) {
-        fps = g_screenStreamActualFps;
-        quality = g_screenStreamActualQuality;
-        frameInterval = 1000 / fps;
+	while (g_screenStreamActive) {
+		int fps = g_streamingFps.load();
+		int frameInterval = 1000 / fps;
 
-        auto start = steady_clock::now();
-        HBITMAP hBitmap = CaptureScreenBitmap(width, height);
-        std::vector<BYTE> jpgBuffer;
-        if (!BitmapToJPEGBuffer(hBitmap, jpgBuffer, quality)) {
-            DeleteObject(hBitmap);
-            continue;
-        }
-        DeleteObject(hBitmap);
-        uint32_t sz = jpgBuffer.size();
-        uint32_t szNet = htonl(sz);
+		auto start = steady_clock::now();
+		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
+		std::vector<uint8_t> qoiBuffer;
+		int imgW, imgH;
+		if (!BitmapToQOIBuffer(hBitmap, qoiBuffer, imgW, imgH)) {
+			DeleteObject(hBitmap);
+			continue;
+		}
+		DeleteObject(hBitmap);
 
-        int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
-        if (ret != sizeof(szNet)) break;
-        size_t offset = 0;
-        while (offset < sz) {
-            int sent = send(sktClient, (const char*)(jpgBuffer.data() + offset), sz - offset, 0);
-            if (sent <= 0) goto END;
-            offset += sent;
-        }
-        frames++;
-        bytes += sz + sizeof(szNet);
-        g_screenStreamW = width;
-        g_screenStreamH = height;
+		uint32_t sz = (uint32_t)qoiBuffer.size();
+		uint32_t szNet = htonl(sz);
 
-        auto now = steady_clock::now();
-        if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
-            g_screenStreamFPS = frames;
-            g_screenStreamBytes = bytes;
-            frames = 0;
-            bytes = 0;
-            lastPrint = now;
-        }
-        auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
-        if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
-    }
+		int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
+		if (ret != sizeof(szNet)) break;
+		size_t offset = 0;
+		while (offset < sz) {
+			int sent = send(sktClient, (const char*)(qoiBuffer.data() + offset), sz - offset, 0);
+			if (sent <= 0) goto END;
+			offset += sent;
+		}
+		frames++;
+		bytes += sz + sizeof(szNet);
+		g_screenStreamW = width;
+		g_screenStreamH = height;
+
+		auto now = steady_clock::now();
+		if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
+			g_screenStreamFPS = frames;
+			g_screenStreamBytes = bytes;
+			frames = 0;
+			bytes = 0;
+			lastPrint = now;
+		}
+		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
+		if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
+	}
 END:
-    closesocket(sktClient);
-    g_screenStreamActive = false;
+	closesocket(sktClient);
+	g_screenStreamActive = false;
 }
+
 
 
 
@@ -730,14 +753,14 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 		int ret = recv(skt, (char*)&szNet, sizeof(szNet), MSG_WAITALL);
 		if (ret != sizeof(szNet)) break;
 		uint32_t sz = ntohl(szNet);
-		std::vector<BYTE> buffer(sz);
+		std::vector<uint8_t> buffer(sz);
 		size_t offset = 0;
 		while (offset < sz) {
 			int got = recv(skt, (char*)(buffer.data() + offset), sz - offset, 0);
 			if (got <= 0) goto END;
 			offset += got;
 		}
-		HBITMAP hBmp = JPEGBufferToBitmap(buffer.data(), buffer.size());
+		HBITMAP hBmp = QOIBufferToBitmap(buffer.data(), buffer.size());
 		BITMAP bmInfo;
 		GetObject(hBmp, sizeof(bmInfo), &bmInfo);
 		scrW = bmInfo.bmWidth;
@@ -759,8 +782,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			bytesLastSec = 0;
 			framesLastSec = 0;
 			lastSec = now;
-			}
-
+		}
 	}
 END:
 	PostMessage(hwnd, WM_CLOSE, 0, 0);
@@ -1963,17 +1985,17 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 			// Handle control messages from client
 			RemoteCtrlMsg* msg = (RemoteCtrlMsg*)buffer;
 			if (msg->type == RemoteCtrlType::SetQuality) {
-				static const int levels[] = { 0, 20, 40, 60, 80 };
+				static const int levels[] = { 20, 40, 60, 80, 100 };
 				int q = msg->value;
-				if (q >= 1 && q <= 4) {
-					g_screenStreamActualQuality = levels[q];
+				if (q >= 1 && q <= 5) {
+					g_streamingQuality = levels[q];
 					std::cout << "Set streaming quality to level " << q << " (" << levels[q] << ")\n";
 				}
 			}
 			else if (msg->type == RemoteCtrlType::SetFps) {
 				int fps = msg->value;
 				if (fps == 5 || fps == 10 || fps == 20 || fps == 30 || fps == 40 || fps == 60) {
-					g_screenStreamActualFps = fps;
+					g_streamingFps = fps;
 					std::cout << "Set streaming FPS to " << fps << "\n";
 				}
 			}
@@ -2111,13 +2133,11 @@ bool MainWindow::LoadConfig()
 
 int main()
 {
-	InitGDIPlus();
 	// ---- Ensure WSAStartup is called ONCE here ----
 	WSADATA wsadata;
 	int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
 	if (wsaResult != 0) {
 		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
-		ShutdownGDIPlus();
 		return 1;
 	}
 	MainWindow win;
@@ -2126,7 +2146,6 @@ int main()
 	{
 		std::cout << "error creating the main window: " << GetLastError() << std::endl;
 		WSACleanup();
-		ShutdownGDIPlus();
 		return 0;
 	}
 
@@ -2139,6 +2158,5 @@ int main()
 		DispatchMessage(&msg);
 	}
 	WSACleanup();
-	ShutdownGDIPlus();
 	return 0;
 }
