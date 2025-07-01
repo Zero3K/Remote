@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 
+#define NOMINMAX
 #include <Windows.h>
 #include <windowsx.h>
 
@@ -25,6 +26,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <set> // DIRTY RECT
+#include <algorithm> // DIRTY RECT
 #pragma comment(lib, "Ws2_32.lib")
 
 enum class RemoteCtrlType : uint8_t {
@@ -36,6 +39,76 @@ struct RemoteCtrlMsg {
 	RemoteCtrlType type;
 	uint8_t value; // quality: [1-4], fps: [5,10,20,30,40,60]
 };
+
+// --- DIRTY RECTANGLE STRUCT ---
+struct DirtyRect {
+	int left, top, right, bottom;
+	bool operator<(const DirtyRect& other) const {
+		if (top != other.top) return top < other.top;
+		if (left != other.left) return left < other.left;
+		if (right != other.right) return right < other.right;
+		return bottom < other.bottom;
+	}
+};
+
+/**
+ * Compare two 32bpp RGBA framebuffers and collect dirty rectangles.
+ * A simple line-by-line approach: every run of changed pixels on a scanline is a rect.
+ * Optionally, you could merge rectangles for better packing.
+ */
+void detect_dirty_rects(
+	const uint32_t* prev, const uint32_t* curr, int width, int height,
+	std::vector<DirtyRect>& out_rects
+) {
+	out_rects.clear();
+	for (int y = 0; y < height; ++y) {
+		int run_start = -1;
+		for (int x = 0; x < width; ++x) {
+			int idx = y * width + x;
+			if (prev[idx] != curr[idx]) {
+				if (run_start == -1) run_start = x;
+			}
+			else {
+				if (run_start != -1) {
+					out_rects.push_back({ run_start, y, x, y + 1 });
+					run_start = -1;
+				}
+			}
+		}
+		if (run_start != -1)
+			out_rects.push_back({ run_start, y, width, y + 1 });
+	}
+	// Optionally merge adjacent rects here
+}
+
+// --- QOI utility for extracting subimages ---
+void extract_subimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyRect& r, std::vector<uint8_t>& out_rgba) {
+	int rw = r.right - r.left, rh = r.bottom - r.top;
+	out_rgba.resize(rw * rh * 4);
+	for (int row = 0; row < rh; ++row) {
+		const uint8_t* src = &rgba[((r.top + row) * width + r.left) * 4];
+		uint8_t* dst = &out_rgba[(row * rw) * 4];
+		memcpy(dst, src, rw * 4);
+	}
+}
+
+// --- QOI encode a subimage ---
+bool QOIEncodeSubimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyRect& r, std::vector<uint8_t>& outQoi) {
+	std::vector<uint8_t> subimg;
+	extract_subimage(rgba, width, height, r, subimg);
+	qoi_desc desc;
+	desc.width = r.right - r.left;
+	desc.height = r.bottom - r.top;
+	desc.channels = 4;
+	desc.colorspace = QOI_SRGB;
+	int out_len = 0;
+	void* qoi_data = qoi_encode(subimg.data(), &desc, &out_len);
+	if (!qoi_data) return false;
+	outQoi.resize(out_len);
+	memcpy(outQoi.data(), qoi_data, out_len);
+	free(qoi_data);
+	return true;
+}
 
 class MainWindow; // forward declaration, so 'extern MainWindow* ...' is legal
 extern MainWindow* g_pMainWindow;
@@ -542,6 +615,13 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	g_screenStreamBytes = 0;
 	g_screenStreamFPS = 0;
 
+	std::vector<uint8_t> prev_rgba;
+	std::vector<uint8_t> curr_rgba;
+	std::vector<uint32_t> prev_pixels;
+	std::vector<uint32_t> curr_pixels;
+
+	bool first = true;
+
 	auto lastPrint = steady_clock::now();
 	int frames = 0;
 	size_t bytes = 0;
@@ -554,25 +634,63 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
 		std::vector<uint8_t> qoiBuffer;
 		int imgW, imgH;
-		if (!BitmapToQOIBuffer(hBitmap, qoiBuffer, imgW, imgH)) {
+		if (!HBITMAPToRGBA(hBitmap, curr_rgba, imgW, imgH)) {
 			DeleteObject(hBitmap);
 			continue;
 		}
 		DeleteObject(hBitmap);
 
-		uint32_t sz = (uint32_t)qoiBuffer.size();
-		uint32_t szNet = htonl(sz);
+		curr_pixels.resize(imgW * imgH);
+		memcpy(curr_pixels.data(), curr_rgba.data(), imgW * imgH * 4);
 
-		int ret = send(sktClient, (const char*)&szNet, sizeof(szNet), 0);
-		if (ret != sizeof(szNet)) break;
-		size_t offset = 0;
-		while (offset < sz) {
-			int sent = send(sktClient, (const char*)(qoiBuffer.data() + offset), sz - offset, 0);
-			if (sent <= 0) goto END;
-			offset += sent;
+		// --- DIRTY RECT: Compare prev and curr, send dirty rects ---
+		std::vector<DirtyRect> dirtyRects;
+		if (first) {
+			dirtyRects.push_back({ 0, 0, imgW, imgH });
+			prev_rgba = curr_rgba;
+			prev_pixels = curr_pixels;
+			first = false;
 		}
+		else {
+			detect_dirty_rects(prev_pixels.data(), curr_pixels.data(), imgW, imgH, dirtyRects);
+		}
+
+		// Send number of dirty rects as uint32_t
+		uint32_t nRects = (uint32_t)dirtyRects.size();
+		uint32_t nRectsNet = htonl(nRects);
+		int ret = send(sktClient, (const char*)&nRectsNet, sizeof(nRectsNet), 0);
+		if (ret != sizeof(nRectsNet)) break;
+
+		for (const auto& r : dirtyRects) {
+			int rw = r.right - r.left, rh = r.bottom - r.top;
+			std::vector<uint8_t> qoiData;
+			QOIEncodeSubimage(curr_rgba, imgW, imgH, r, qoiData);
+
+			uint32_t xNet = htonl(r.left);
+			uint32_t yNet = htonl(r.top);
+			uint32_t wNet = htonl(rw);
+			uint32_t hNet = htonl(rh);
+			uint32_t qoiLenNet = htonl((uint32_t)qoiData.size());
+
+			send(sktClient, (const char*)&xNet, 4, 0);
+			send(sktClient, (const char*)&yNet, 4, 0);
+			send(sktClient, (const char*)&wNet, 4, 0);
+			send(sktClient, (const char*)&hNet, 4, 0);
+			send(sktClient, (const char*)&qoiLenNet, 4, 0);
+
+			size_t offset = 0;
+			while (offset < qoiData.size()) {
+				int sent = send(sktClient, (const char*)(qoiData.data() + offset), qoiData.size() - offset, 0);
+				if (sent <= 0) goto END;
+				offset += sent;
+			}
+
+			bytes += qoiData.size() + 20; // 5 uint32_t fields per rect
+		}
+		prev_rgba = curr_rgba;
+		prev_pixels = curr_pixels;
+
 		frames++;
-		bytes += sz + sizeof(szNet);
 		g_screenStreamW = width;
 		g_screenStreamH = height;
 
@@ -831,25 +949,83 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	int framesLastSec = 0;
 	int scrW = 0, scrH = 0;
 	auto lastSec = std::chrono::steady_clock::now();
+
+	static HBITMAP hBitmap = NULL;
+	static void* dibBits = nullptr;      // <-- Store DIBSection bits pointer here!
+	static std::vector<uint8_t> framebuffer;
+	static int fbW = 0, fbH = 0;
+
 	while (true) {
-		uint32_t szNet = 0;
-		int ret = recv(skt, (char*)&szNet, sizeof(szNet), MSG_WAITALL);
-		if (ret != sizeof(szNet)) break;
-		uint32_t sz = ntohl(szNet);
-		std::vector<uint8_t> buffer(sz);
-		size_t offset = 0;
-		while (offset < sz) {
-			int got = recv(skt, (char*)(buffer.data() + offset), sz - offset, 0);
-			if (got <= 0) goto END;
-			offset += got;
+		// Receive number of rects
+		uint32_t nRectsNet = 0;
+		int ret = recv(skt, (char*)&nRectsNet, 4, MSG_WAITALL);
+		if (ret != 4) break;
+		uint32_t nRects = ntohl(nRectsNet);
+		if (nRects == 0) continue;
+
+		for (uint32_t i = 0; i < nRects; ++i) {
+			uint32_t x, y, w, h, qoiLen;
+			if (recv(skt, (char*)&x, 4, MSG_WAITALL) != 4) goto END;
+			if (recv(skt, (char*)&y, 4, MSG_WAITALL) != 4) goto END;
+			if (recv(skt, (char*)&w, 4, MSG_WAITALL) != 4) goto END;
+			if (recv(skt, (char*)&h, 4, MSG_WAITALL) != 4) goto END;
+			if (recv(skt, (char*)&qoiLen, 4, MSG_WAITALL) != 4) goto END;
+			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
+
+			std::vector<uint8_t> qoiData(qoiLen);
+			size_t offset = 0;
+			while (offset < qoiLen) {
+				int got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
+				if (got <= 0) goto END;
+				offset += got;
+			}
+
+			qoi_desc desc;
+			uint8_t* decoded = (uint8_t*)qoi_decode(qoiData.data(), qoiLen, &desc, 4);
+			if (!decoded) continue;
+
+			// First rect: allocate framebuffer and hBitmap
+			if (!hBitmap) {
+				fbW = x + w;
+				fbH = y + h;
+				framebuffer.resize(fbW * fbH * 4, 0);
+				// Create DIBSection and get dibBits pointer!
+				BITMAPINFO bmi = { 0 };
+				bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+				bmi.bmiHeader.biWidth = fbW;
+				bmi.bmiHeader.biHeight = -fbH;
+				bmi.bmiHeader.biPlanes = 1;
+				bmi.bmiHeader.biBitCount = 32;
+				bmi.bmiHeader.biCompression = BI_RGB;
+				hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &dibBits, NULL, 0);
+				if (dibBits && framebuffer.size() == (size_t)(fbW * fbH * 4))
+					memcpy(dibBits, framebuffer.data(), fbW * fbH * 4);
+			}
+
+			// Patch decoded region into framebuffer (with bounds check)
+			for (uint32_t row = 0; row < h; ++row) {
+				if (y + row >= (uint32_t)fbH || x >= (uint32_t)fbW) continue;
+				uint8_t* dst = &framebuffer[((y + row) * fbW + x) * 4];
+				uint8_t* src = &decoded[(row * w) * 4];
+				memcpy(dst, src, std::min(w, (uint32_t)(fbW - x)) * 4);
+			}
+			free(decoded);
+
+			// Copy framebuffer into the DIBSection's pixel data (dibBits)
+			if (dibBits && framebuffer.size() == (size_t)(fbW * fbH * 4)) {
+				memcpy(dibBits, framebuffer.data(), fbW * fbH * 4);
+			}
+
+			// Invalidate only the updated region
+			RECT rect = { (LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h) };
+			InvalidateRect(hwnd, &rect, FALSE);
 		}
-		HBITMAP hBmp = QOIBufferToBitmap(buffer.data(), buffer.size());
-		BITMAP bmInfo;
-		GetObject(hBmp, sizeof(bmInfo), &bmInfo);
-		scrW = bmInfo.bmWidth;
-		scrH = bmInfo.bmHeight;
-		PostMessage(hwnd, WM_USER + 1, MAKELPARAM(scrW, scrH), (LPARAM)hBmp);
-		bytesLastSec += sz + sizeof(szNet);
+		// Only post WM_USER + 1 after DIBSection is made
+		if (hBitmap) {
+			PostMessage(hwnd, WM_USER + 1, MAKELPARAM(fbW, fbH), (LPARAM)hBitmap);
+		}
+
+		bytesLastSec++; // Not accurate here, fix if needed
 		framesLastSec++;
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - lastSec).count() >= 1) {
