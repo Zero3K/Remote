@@ -718,21 +718,74 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		break;
 	}
+
+	case WM_ERASEBKGND:
+		return 1; // Prevent flicker by not erasing background
+
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
+
+		RECT clientRect;
+		GetClientRect(hwnd, &clientRect);
+		int destW = clientRect.right - clientRect.left;
+		int destH = clientRect.bottom - clientRect.top;
+
+		// Double-buffered drawing
+		HDC hdcMem = CreateCompatibleDC(hdc);
+		HBITMAP hbmMem = CreateCompatibleBitmap(hdc, destW, destH);
+		HGDIOBJ oldMemBmp = SelectObject(hdcMem, hbmMem);
+
+		// Fill double buffer with black
+		HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+		FillRect(hdcMem, &clientRect, brush);
+		DeleteObject(brush);
+
 		if (hBitmap) {
-			HDC hMem = CreateCompatibleDC(hdc);
+			HDC hMem = CreateCompatibleDC(hdcMem);
 			HGDIOBJ oldObj = SelectObject(hMem, hBitmap);
 			BITMAP bm;
 			GetObject(hBitmap, sizeof(bm), &bm);
-			StretchBlt(hdc, 0, 0, ps.rcPaint.right, ps.rcPaint.bottom, hMem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+
+			int srcW = bm.bmWidth;
+			int srcH = bm.bmHeight;
+
+			// Calculate aspect-correct destination rectangle
+			double srcAspect = (double)srcW / srcH;
+			double destAspect = (double)destW / destH;
+			int drawW, drawH, offsetX, offsetY;
+
+			if (destAspect > srcAspect) {
+				drawH = destH;
+				drawW = (int)(drawH * srcAspect);
+				offsetX = (destW - drawW) / 2;
+				offsetY = 0;
+			}
+			else {
+				drawW = destW;
+				drawH = (int)(drawW / srcAspect);
+				offsetX = 0;
+				offsetY = (destH - drawH) / 2;
+			}
+
+			StretchBlt(hdcMem, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+
 			SelectObject(hMem, oldObj);
 			DeleteDC(hMem);
 		}
+
+		// Blit double buffer to screen
+		BitBlt(hdc, 0, 0, destW, destH, hdcMem, 0, 0, SRCCOPY);
+
+		// Cleanup
+		SelectObject(hdcMem, oldMemBmp);
+		DeleteObject(hbmMem);
+		DeleteDC(hdcMem);
+
 		EndPaint(hwnd, &ps);
 		break;
-	}
+	}	
+	
 	case WM_DESTROY:
 		if (hBitmap) DeleteObject(hBitmap);
 		break;
@@ -1212,7 +1265,7 @@ int MainWindow::HandleCreate(UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 {
 	//m_btnOk.Create(L"OK", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 0, 50, 50, 100, 100, this->m_hwnd);
-	CreateWindowA("BUTTON", "Mode", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_GROUPBOX, 20, 10, 190, 60, m_hwnd, (HMENU)BTN_MODE, (HINSTANCE)GetWindowLong(m_hwnd, GWL_HINSTANCE), NULL);
+	CreateWindowA("BUTTON", "Mode", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_GROUPBOX, 20, 10, 190, 60, m_hwnd, (HMENU)BTN_MODE, (HINSTANCE)GetWindowLong(m_hwnd, GWLP_HINSTANCE), NULL);
 	m_btnModeServer.Create(this, "Server", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 0, 30, 35, 70, 20, m_hwnd, (HMENU)BTN_SERVER);
 	m_btnModeClient.Create(this, "Client", WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 0, 130, 35, 70, 20, m_hwnd, (HMENU)BTN_CLIENT);
 
