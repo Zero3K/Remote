@@ -549,14 +549,19 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - lastSec).count() >= 1) {
 			double mbps = (bytesLastSec * 8.0) / 1e6;
+			RECT clientRect;
+			GetClientRect(hwnd, &clientRect);
+			int winW = clientRect.right - clientRect.left;
+			int winH = clientRect.bottom - clientRect.top;
 			char title[256];
 			snprintf(title, sizeof(title), "Remote Screen | IP: %s | FPS: %d | Mbps: %.2f | Size: %dx%d",
-				ip.c_str(), framesLastSec, mbps, scrW, scrH);
+				ip.c_str(), framesLastSec, mbps, winW, winH);
 			PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
 			bytesLastSec = 0;
 			framesLastSec = 0;
 			lastSec = now;
-		}
+			}
+
 	}
 END:
 	PostMessage(hwnd, WM_CLOSE, 0, 0);
