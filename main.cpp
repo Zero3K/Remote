@@ -247,23 +247,6 @@ void SetRemoteScreenQuality(HWND hwnd, int qualityLevel) {
 	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
 }
 
-void SetRemoteScreenFps(HWND hwnd, int fps) {
-	g_screenStreamMenuFps = fps;
-	g_screenStreamActualFps = fps;
-
-	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-	if (!psktInput || *psktInput == INVALID_SOCKET) return;
-
-	RemoteCtrlMsg msg = { RemoteCtrlType::SetFps, (uint8_t)fps };
-	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
-
-	// Save FPS to config
-	if (g_pMainWindow) {
-		g_pMainWindow->m_savedFps = fps;
-		g_pMainWindow->SaveConfig();
-	}
-}
-
 // This helper sends special key combos to the remote side
 void SendRemoteKeyCombo(HWND hwnd, int combo) {
 	// Find the input socket for this window
@@ -744,268 +727,6 @@ END:
 	closesocket(sktClient);
 	g_screenStreamActive = false;
 }
-
-
-
-
-// ============ SCREEN STREAM CLIENT WINDOW ============
-
-LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-	// Retrieve per-window state
-	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-
-	switch (msg) {
-	case WM_CREATE:
-		bmpState = new ScreenBitmapState();
-		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)bmpState);
-		break;
-
-	case WM_USER + 100: // Store input socket pointer
-		if (bmpState)
-			bmpState->psktInput = (SOCKET*)lParam;
-		return 0;
-
-	case WM_USER + 1:   // New bitmap and size from thread
-		// No longer handled: thread never allocates a new ScreenBitmapState, only updates its members
-		return 0;
-
-	case WM_USER + 2:
-		SetWindowTextA(hwnd, (const char*)lParam);
-		break;
-
-		// --- Context menu handling (unchanged, but uses hwnd) ---
-	case WM_CONTEXTMENU: {
-		POINT pt;
-		pt.x = LOWORD(lParam);
-		pt.y = HIWORD(lParam);
-		if (pt.x == -1 && pt.y == -1) {
-			RECT rect;
-			GetWindowRect(hwnd, &rect);
-			pt.x = rect.left + (rect.right - rect.left) / 2;
-			pt.y = rect.top + (rect.bottom - rect.top) / 2;
-		}
-		HMENU hMenu = CreateScreenContextMenu();
-		int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
-		if (cmd)
-			PostMessage(hwnd, WM_COMMAND, cmd, 0);
-		DestroyMenu(hMenu);
-		break;
-	}
-	case WM_COMMAND:
-		switch (LOWORD(wParam)) {
-			// Video Quality
-		case IDM_VIDEO_QUALITY_1: SetRemoteScreenQuality(hwnd, 1); break;
-		case IDM_VIDEO_QUALITY_2: SetRemoteScreenQuality(hwnd, 2); break;
-		case IDM_VIDEO_QUALITY_3: SetRemoteScreenQuality(hwnd, 3); break;
-		case IDM_VIDEO_QUALITY_4: SetRemoteScreenQuality(hwnd, 4); break;
-			// Video FPS
-		case IDM_VIDEO_FPS_5: SetRemoteScreenFps(hwnd, 5); break;
-		case IDM_VIDEO_FPS_10: SetRemoteScreenFps(hwnd, 10); break;
-		case IDM_VIDEO_FPS_20: SetRemoteScreenFps(hwnd, 20); break;
-		case IDM_VIDEO_FPS_30: SetRemoteScreenFps(hwnd, 30); break;
-		case IDM_VIDEO_FPS_40: SetRemoteScreenFps(hwnd, 40); break;
-		case IDM_VIDEO_FPS_60: SetRemoteScreenFps(hwnd, 60); break;
-			// Always On Top
-		extern MainWindow* g_pMainWindow;
-        case IDM_ALWAYS_ON_TOP:
-			g_alwaysOnTop = !g_alwaysOnTop;
-			if (g_pMainWindow) {
-				g_pMainWindow->m_savedAlwaysOnTop = g_alwaysOnTop;
-				g_pMainWindow->SaveConfig();
-			}
-			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-			break;
-			// Send Keys
-		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
-		case IDM_SENDKEYS_CTRLESC:  SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRLESC); break;
-		case IDM_SENDKEYS_CTRALTDEL:SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRALTDEL); break;
-		case IDM_SENDKEYS_PRNTSCRN: SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_PRNTSCRN); break;
-		}
-		break;
-
-		// --- Input handling uses bmpState->psktInput ---
-	case WM_LBUTTONDOWN:
-	case WM_LBUTTONUP:
-	case WM_RBUTTONDOWN:
-	case WM_RBUTTONUP:
-	case WM_MBUTTONDOWN:
-	case WM_MBUTTONUP:
-	case WM_MOUSEMOVE:
-	{
-		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
-			INPUT input = {};
-			input.type = INPUT_MOUSE;
-
-			POINT pt;
-			pt.x = GET_X_LPARAM(lParam);
-			pt.y = GET_Y_LPARAM(lParam);
-
-			RECT rect;
-			GetClientRect(hwnd, &rect);
-			int winW = rect.right - rect.left, winH = rect.bottom - rect.top;
-			int normX = 0, normY = 0;
-			if (winW > 0 && winH > 0) {
-				normX = (int)((pt.x / (double)winW) * nNormalized);
-				normY = (int)((pt.y / (double)winH) * nNormalized);
-			}
-
-			input.mi.dx = normX;
-			input.mi.dy = normY;
-			input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-			if (msg == WM_LBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
-			if (msg == WM_LBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-			if (msg == WM_RBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
-			if (msg == WM_RBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
-			if (msg == WM_MBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
-			if (msg == WM_MBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
-
-			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
-		}
-		break;
-	}
-	case WM_MOUSEWHEEL:
-	{
-		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
-			INPUT input = {};
-			input.type = INPUT_MOUSE;
-			input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-			input.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
-			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
-		}
-		break;
-	}
-	case WM_KEYDOWN:
-	case WM_KEYUP:
-	{
-		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
-			INPUT input = {};
-			input.type = INPUT_KEYBOARD;
-			input.ki.wVk = (WORD)wParam;
-			input.ki.wScan = MapVirtualKeyA((UINT)wParam, MAPVK_VK_TO_VSC);
-			input.ki.dwFlags = (msg == WM_KEYUP) ? KEYEVENTF_KEYUP : 0;
-			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
-		}
-		break;
-	}
-
-	case WM_ERASEBKGND:
-		return 1; // Prevent flicker
-
-	case WM_PAINT: {
-		PAINTSTRUCT ps;
-		HDC hdc = BeginPaint(hwnd, &ps);
-
-		RECT clientRect;
-		GetClientRect(hwnd, &clientRect);
-		int destW = clientRect.right - clientRect.left;
-		int destH = clientRect.bottom - clientRect.top;
-
-		static HBITMAP hDoubleBufBmp = NULL;
-		static void* pDoubleBufBits = NULL;
-		static int doubleBufW = 0, doubleBufH = 0;
-
-		if (destW <= 0 || destH <= 0) {
-			EndPaint(hwnd, &ps);
-			break;
-		}
-
-		if (!hDoubleBufBmp || doubleBufW != destW || doubleBufH != destH) {
-			if (hDoubleBufBmp) {
-				DeleteObject(hDoubleBufBmp);
-				hDoubleBufBmp = NULL;
-				pDoubleBufBits = NULL;
-			}
-			BITMAPINFO bmi = { 0 };
-			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-			bmi.bmiHeader.biWidth = destW;
-			bmi.bmiHeader.biHeight = -destH;
-			bmi.bmiHeader.biPlanes = 1;
-			bmi.bmiHeader.biBitCount = 32;
-			bmi.bmiHeader.biCompression = BI_RGB;
-			hDoubleBufBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pDoubleBufBits, NULL, 0);
-			doubleBufW = destW;
-			doubleBufH = destH;
-			if (pDoubleBufBits)
-				memset(pDoubleBufBits, 0xCC, destW * destH * 4); // For debug
-		}
-
-		HDC hdcBuf = CreateCompatibleDC(hdc);
-		HGDIOBJ oldBufBmp = SelectObject(hdcBuf, hDoubleBufBmp);
-
-		HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
-		FillRect(hdcBuf, &clientRect, brush);
-		DeleteObject(brush);
-
-		if (bmpState) {
-			EnterCriticalSection(&bmpState->cs);
-			if (bmpState->hBitmap && bmpState->dibBits) {
-				BITMAP bm = {};
-				if (GetObject(bmpState->hBitmap, sizeof(bm), &bm) == sizeof(bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
-					int srcW = bm.bmWidth;
-					int srcH = bm.bmHeight;
-
-					double srcAspect = (double)srcW / srcH;
-					double destAspect = (double)destW / destH;
-					int drawW, drawH, offsetX, offsetY;
-					if (destAspect > srcAspect) {
-						drawH = destH;
-						drawW = (int)(drawH * srcAspect);
-						offsetX = (destW - drawW) / 2;
-						offsetY = 0;
-					}
-					else {
-						drawW = destW;
-						drawH = (int)(drawW / srcAspect);
-						offsetX = 0;
-						offsetY = (destH - drawH) / 2;
-					}
-
-					HDC hMem = CreateCompatibleDC(hdcBuf);
-					HGDIOBJ oldObj = SelectObject(hMem, bmpState->hBitmap);
-
-					if (drawW == srcW && drawH == srcH) {
-						BitBlt(hdcBuf, offsetX, offsetY, srcW, srcH, hMem, 0, 0, SRCCOPY);
-					}
-					else {
-						SetStretchBltMode(hdcBuf, COLORONCOLOR);
-						StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
-					}
-
-					SelectObject(hMem, oldObj);
-					DeleteDC(hMem);
-				}
-			}
-			LeaveCriticalSection(&bmpState->cs);
-		}
-
-		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
-
-		SelectObject(hdcBuf, oldBufBmp);
-		DeleteDC(hdcBuf);
-
-		EndPaint(hwnd, &ps);
-		break;
-	}
-	case WM_DESTROY: {
-		static HBITMAP hDoubleBufBmp = NULL;
-		static void* pDoubleBufBits = NULL;
-		if (hDoubleBufBmp) {
-			DeleteObject(hDoubleBufBmp);
-			hDoubleBufBmp = NULL;
-			pDoubleBufBits = NULL;
-		}
-		if (bmpState) {
-			delete bmpState;
-			SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
-		}
-		break;
-	}
-	default:
-		return DefWindowProc(hwnd, msg, wParam, lParam);
-	}
-	return 0;
-}
-
 
 // Store a pointer to this struct in the window's GWLP_USERDATA
 // You must set this on window creation.
@@ -1492,6 +1213,280 @@ MainWindow::~MainWindow()
 
 MainWindow* g_pMainWindow = nullptr;
 
+void SetRemoteScreenFps(HWND hwnd, int fps) {
+	g_screenStreamMenuFps = fps;
+	g_screenStreamActualFps = fps;
+
+	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+	if (!psktInput || *psktInput == INVALID_SOCKET) return;
+
+	RemoteCtrlMsg msg = { RemoteCtrlType::SetFps, (uint8_t)fps };
+	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
+
+	// Save FPS to config
+	if (g_pMainWindow) {
+		g_pMainWindow->m_savedFps = fps;
+		g_pMainWindow->SaveConfig();
+	}
+}
+
+// ============ SCREEN STREAM CLIENT WINDOW ============
+
+LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	// Retrieve per-window state
+	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+
+	switch (msg) {
+	case WM_CREATE:
+		bmpState = new ScreenBitmapState();
+		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)bmpState);
+		break;
+
+	case WM_USER + 100: // Store input socket pointer
+		if (bmpState)
+			bmpState->psktInput = (SOCKET*)lParam;
+		return 0;
+
+	case WM_USER + 1:   // New bitmap and size from thread
+		// No longer handled: thread never allocates a new ScreenBitmapState, only updates its members
+		return 0;
+
+	case WM_USER + 2:
+		SetWindowTextA(hwnd, (const char*)lParam);
+		break;
+
+		// --- Context menu handling (unchanged, but uses hwnd) ---
+	case WM_CONTEXTMENU: {
+		POINT pt;
+		pt.x = LOWORD(lParam);
+		pt.y = HIWORD(lParam);
+		if (pt.x == -1 && pt.y == -1) {
+			RECT rect;
+			GetWindowRect(hwnd, &rect);
+			pt.x = rect.left + (rect.right - rect.left) / 2;
+			pt.y = rect.top + (rect.bottom - rect.top) / 2;
+		}
+		HMENU hMenu = CreateScreenContextMenu();
+		int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+		if (cmd)
+			PostMessage(hwnd, WM_COMMAND, cmd, 0);
+		DestroyMenu(hMenu);
+		break;
+	}
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+			// Video Quality
+		case IDM_VIDEO_QUALITY_1: SetRemoteScreenQuality(hwnd, 1); break;
+		case IDM_VIDEO_QUALITY_2: SetRemoteScreenQuality(hwnd, 2); break;
+		case IDM_VIDEO_QUALITY_3: SetRemoteScreenQuality(hwnd, 3); break;
+		case IDM_VIDEO_QUALITY_4: SetRemoteScreenQuality(hwnd, 4); break;
+			// Video FPS
+		case IDM_VIDEO_FPS_5: SetRemoteScreenFps(hwnd, 5); break;
+		case IDM_VIDEO_FPS_10: SetRemoteScreenFps(hwnd, 10); break;
+		case IDM_VIDEO_FPS_20: SetRemoteScreenFps(hwnd, 20); break;
+		case IDM_VIDEO_FPS_30: SetRemoteScreenFps(hwnd, 30); break;
+		case IDM_VIDEO_FPS_40: SetRemoteScreenFps(hwnd, 40); break;
+		case IDM_VIDEO_FPS_60: SetRemoteScreenFps(hwnd, 60); break;
+			// Always On Top
+		case IDM_ALWAYS_ON_TOP:
+			g_alwaysOnTop = !g_alwaysOnTop;
+			if (g_pMainWindow) {
+				g_pMainWindow->m_savedAlwaysOnTop = g_alwaysOnTop;
+				g_pMainWindow->SaveConfig();
+			}
+			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+			break;
+			// Send Keys
+		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
+		case IDM_SENDKEYS_CTRLESC:  SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRLESC); break;
+		case IDM_SENDKEYS_CTRALTDEL:SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRALTDEL); break;
+		case IDM_SENDKEYS_PRNTSCRN: SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_PRNTSCRN); break;
+		}
+		break;
+
+		// --- Input handling uses bmpState->psktInput ---
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_MBUTTONDOWN:
+	case WM_MBUTTONUP:
+	case WM_MOUSEMOVE:
+	{
+		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_MOUSE;
+
+			POINT pt;
+			pt.x = GET_X_LPARAM(lParam);
+			pt.y = GET_Y_LPARAM(lParam);
+
+			RECT rect;
+			GetClientRect(hwnd, &rect);
+			int winW = rect.right - rect.left, winH = rect.bottom - rect.top;
+			int normX = 0, normY = 0;
+			if (winW > 0 && winH > 0) {
+				normX = (int)((pt.x / (double)winW) * nNormalized);
+				normY = (int)((pt.y / (double)winH) * nNormalized);
+			}
+
+			input.mi.dx = normX;
+			input.mi.dy = normY;
+			input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+			if (msg == WM_LBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+			if (msg == WM_LBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+			if (msg == WM_RBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_RIGHTDOWN;
+			if (msg == WM_RBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+			if (msg == WM_MBUTTONDOWN) input.mi.dwFlags |= MOUSEEVENTF_MIDDLEDOWN;
+			if (msg == WM_MBUTTONUP)   input.mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+
+			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
+		break;
+	}
+	case WM_MOUSEWHEEL:
+	{
+		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_MOUSE;
+			input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+			input.mi.mouseData = GET_WHEEL_DELTA_WPARAM(wParam);
+			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
+		break;
+	}
+	case WM_KEYDOWN:
+	case WM_KEYUP:
+	{
+		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
+			INPUT input = {};
+			input.type = INPUT_KEYBOARD;
+			input.ki.wVk = (WORD)wParam;
+			input.ki.wScan = MapVirtualKeyA((UINT)wParam, MAPVK_VK_TO_VSC);
+			input.ki.dwFlags = (msg == WM_KEYUP) ? KEYEVENTF_KEYUP : 0;
+			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
+		}
+		break;
+	}
+
+	case WM_ERASEBKGND:
+		return 1; // Prevent flicker
+
+	case WM_PAINT: {
+		PAINTSTRUCT ps;
+		HDC hdc = BeginPaint(hwnd, &ps);
+
+		RECT clientRect;
+		GetClientRect(hwnd, &clientRect);
+		int destW = clientRect.right - clientRect.left;
+		int destH = clientRect.bottom - clientRect.top;
+
+		static HBITMAP hDoubleBufBmp = NULL;
+		static void* pDoubleBufBits = NULL;
+		static int doubleBufW = 0, doubleBufH = 0;
+
+		if (destW <= 0 || destH <= 0) {
+			EndPaint(hwnd, &ps);
+			break;
+		}
+
+		if (!hDoubleBufBmp || doubleBufW != destW || doubleBufH != destH) {
+			if (hDoubleBufBmp) {
+				DeleteObject(hDoubleBufBmp);
+				hDoubleBufBmp = NULL;
+				pDoubleBufBits = NULL;
+			}
+			BITMAPINFO bmi = { 0 };
+			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+			bmi.bmiHeader.biWidth = destW;
+			bmi.bmiHeader.biHeight = -destH;
+			bmi.bmiHeader.biPlanes = 1;
+			bmi.bmiHeader.biBitCount = 32;
+			bmi.bmiHeader.biCompression = BI_RGB;
+			hDoubleBufBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pDoubleBufBits, NULL, 0);
+			doubleBufW = destW;
+			doubleBufH = destH;
+			if (pDoubleBufBits)
+				memset(pDoubleBufBits, 0xCC, destW * destH * 4); // For debug
+		}
+
+		HDC hdcBuf = CreateCompatibleDC(hdc);
+		HGDIOBJ oldBufBmp = SelectObject(hdcBuf, hDoubleBufBmp);
+
+		HBRUSH brush = CreateSolidBrush(RGB(0, 0, 0));
+		FillRect(hdcBuf, &clientRect, brush);
+		DeleteObject(brush);
+
+		if (bmpState) {
+			EnterCriticalSection(&bmpState->cs);
+			if (bmpState->hBitmap && bmpState->dibBits) {
+				BITMAP bm = {};
+				if (GetObject(bmpState->hBitmap, sizeof(bm), &bm) == sizeof(bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
+					int srcW = bm.bmWidth;
+					int srcH = bm.bmHeight;
+
+					double srcAspect = (double)srcW / srcH;
+					double destAspect = (double)destW / destH;
+					int drawW, drawH, offsetX, offsetY;
+					if (destAspect > srcAspect) {
+						drawH = destH;
+						drawW = (int)(drawH * srcAspect);
+						offsetX = (destW - drawW) / 2;
+						offsetY = 0;
+					}
+					else {
+						drawW = destW;
+						drawH = (int)(drawW / srcAspect);
+						offsetX = 0;
+						offsetY = (destH - drawH) / 2;
+					}
+
+					HDC hMem = CreateCompatibleDC(hdcBuf);
+					HGDIOBJ oldObj = SelectObject(hMem, bmpState->hBitmap);
+
+					if (drawW == srcW && drawH == srcH) {
+						BitBlt(hdcBuf, offsetX, offsetY, srcW, srcH, hMem, 0, 0, SRCCOPY);
+					}
+					else {
+						SetStretchBltMode(hdcBuf, COLORONCOLOR);
+						StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+					}
+
+					SelectObject(hMem, oldObj);
+					DeleteDC(hMem);
+				}
+			}
+			LeaveCriticalSection(&bmpState->cs);
+		}
+
+		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
+
+		SelectObject(hdcBuf, oldBufBmp);
+		DeleteDC(hdcBuf);
+
+		EndPaint(hwnd, &ps);
+		break;
+	}
+	case WM_DESTROY: {
+		static HBITMAP hDoubleBufBmp = NULL;
+		static void* pDoubleBufBits = NULL;
+		if (hDoubleBufBmp) {
+			DeleteObject(hDoubleBufBmp);
+			hDoubleBufBmp = NULL;
+			pDoubleBufBits = NULL;
+		}
+		if (bmpState) {
+			delete bmpState;
+			SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+		}
+		break;
+	}
+	default:
+		return DefWindowProc(hwnd, msg, wParam, lParam);
+	}
+	return 0;
+}
+
 void StartScreenRecv(std::string server_ip, int port) {
 	// Reuse main input socket if possible
 	SOCKET* psktInput = nullptr;
@@ -1567,6 +1562,7 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 			m_savedWinW = r.right - r.left;
 			m_savedWinH = r.bottom - r.top;
 			SaveConfig();
+			break;
 		}
 	case WM_DESTROY:
 		PostQuitMessage(0);
