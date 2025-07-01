@@ -256,6 +256,12 @@ void SetRemoteScreenFps(HWND hwnd, int fps) {
 
 	RemoteCtrlMsg msg = { RemoteCtrlType::SetFps, (uint8_t)fps };
 	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
+
+	// Save FPS to config
+	if (g_pMainWindow) {
+		g_pMainWindow->m_savedFps = fps;
+		g_pMainWindow->SaveConfig();
+	}
 }
 
 // This helper sends special key combos to the remote side
@@ -426,11 +432,11 @@ int ReceiveServer(SOCKET sktConn, INPUT& data);
 int CloseConnection(SOCKET* sktConn);
 
 // Externs for screen streaming global state
-extern std::atomic<bool> g_screenStreamActive;
-extern std::atomic<size_t> g_screenStreamBytes;
-extern std::atomic<int> g_screenStreamFPS;
-extern std::atomic<int> g_screenStreamW;
-extern std::atomic<int> g_screenStreamH;
+std::atomic<bool> g_screenStreamActive(false);
+std::atomic<size_t> g_screenStreamBytes(0);
+std::atomic<int> g_screenStreamFPS(0);
+std::atomic<int> g_screenStreamW(0);
+std::atomic<int> g_screenStreamH(0);
 
 // Streaming server/client declarations
 void ScreenStreamServerThread(SOCKET sktClient);
@@ -808,7 +814,9 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			// Always On Top
 		case IDM_ALWAYS_ON_TOP:
 			g_alwaysOnTop = !g_alwaysOnTop;
+			m_savedAlwaysOnTop = g_alwaysOnTop;
 			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+			SaveConfig();
 			break;
 			// Send Keys
 		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
@@ -1310,6 +1318,12 @@ public:
 class MainWindow : public BaseWindow
 {
 public:
+	int m_savedFps = SCREEN_STREAM_FPS;
+	bool m_savedAlwaysOnTop = false;
+	int m_savedWinW = 477;
+	int m_savedWinH = 340;
+
+public:
 	MainWindow();
 	~MainWindow();
 
@@ -1522,41 +1536,50 @@ void StartScreenRecv(std::string server_ip, int port) {
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
-    {
+	{
 	case WM_CREATE:
-		 return HandleCreate(uMsg, wParam, lParam);
+		return HandleCreate(uMsg, wParam, lParam);
 	case WM_INPUT:
 		// CLIENT mode: capture input, send to server
 		if (Data.nMode == MODE::CLIENT && Client.isConnected) {
-		unsigned int dwSize;
-		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER)) == -1) break;
-		LPBYTE lpb = new unsigned char[dwSize];
-		if (!lpb) break;
-		if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
-		delete[] lpb; break;
-		}
-		INPUT inputBuff;
-		ConvertInput((PRAWINPUT)lpb, &inputBuff);
-	    delete[] lpb;
-		
-		// Send to server
-		send(Client.sktServer, (char*)&inputBuff, sizeof(INPUT), 0);
+			unsigned int dwSize;
+			if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER)) == -1) break;
+			LPBYTE lpb = new unsigned char[dwSize];
+			if (!lpb) break;
+			if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER)) != dwSize) {
+				delete[] lpb; break;
+			}
+			INPUT inputBuff;
+			ConvertInput((PRAWINPUT)lpb, &inputBuff);
+			delete[] lpb;
+
+			// Send to server
+			send(Client.sktServer, (char*)&inputBuff, sizeof(INPUT), 0);
 		}
 		return 0;
-	 case WM_PAINT:
-		 return HandlePaint(uMsg, wParam, lParam);
+	case WM_PAINT:
+		return HandlePaint(uMsg, wParam, lParam);
 	case WM_COMMAND:
-		 return HandleCommand(uMsg, wParam, lParam);
+		return HandleCommand(uMsg, wParam, lParam);
 	case WM_CLOSE:
-		 return HandleClose(uMsg, wParam, lParam);
+		return HandleClose(uMsg, wParam, lParam);
+	case WM_SIZE:
+	{
+		RECT r;
+		if (m_hwnd && GetWindowRect(m_hwnd, &r)) {
+			m_savedWinW = r.right - r.left;
+			m_savedWinH = r.bottom - r.top;
+			SaveConfig();
+		}
 	case WM_DESTROY:
-		 PostQuitMessage(0);
-		 return 0;
+		PostQuitMessage(0);
+		return 0;
 	default:
-		 return DefWindowProc(m_hwnd, uMsg, wParam, lParam);
-		 }
+		return DefWindowProc(m_hwnd, uMsg, wParam, lParam);
+	}
 	return TRUE;
 	}
+}
 
 // Removed RetrieveInput logic (no longer used on server)
 
@@ -2477,71 +2500,104 @@ int MainWindow::ReceiveThread()
 }
 
 
- bool MainWindow::SaveConfig()
- {
-	std::fstream f(configName, std::fstream::out | std::fstream::trunc);
-	if (!f.is_open())
-	{
-		std::cout << "can't save" << std::endl;
-		return false;
-	}
-	f << "port " << sPort << std::endl;
-	f << "server_ip " << Client.ip << std::endl;
-	f << "max_clients " << Server.maxClients;
-	f.close();
-	return true;
-}
-bool MainWindow::LoadConfig()
-{
-	sPort = std::to_string(DEFAULT_PORT);
-	iPort = std::stoi(sPort);
-	Server.maxClients = MAX_CLIENTS;
-	std::fstream f(configName, std::fstream::in);
-	if (!f.is_open())
-	{
-		return false;
-	}
+	 // --- SaveConfig: now saves FPS, AlwaysOnTop, and window size ---
+	 bool MainWindow::SaveConfig()
+	 {
+		 std::fstream f(configName, std::fstream::out | std::fstream::trunc);
+		 if (!f.is_open())
+		 {
+			 std::cout << "can't save" << std::endl;
+			 return false;
+		 }
+		 f << "port " << sPort << std::endl;
+		 f << "server_ip " << Client.ip << std::endl;
+		 f << "max_clients " << Server.maxClients << std::endl;
+		 f << "fps " << g_streamingFps.load() << std::endl;
+		 f << "always_on_top " << (g_alwaysOnTop ? 1 : 0) << std::endl;
+		 RECT r;
+		 if (m_hwnd && GetWindowRect(m_hwnd, &r)) {
+			 f << "window_size " << (r.right - r.left) << " " << (r.bottom - r.top) << std::endl;
+		 }
+		 else {
+			 f << "window_size " << m_savedWinW << " " << m_savedWinH << std::endl;
+		 }
+		 f.close();
+		 return true;
+	 }
+	 // --- LoadConfig: now loads FPS, AlwaysOnTop, and window size ---
+	 bool MainWindow::LoadConfig()
+	 {
+		 sPort = std::to_string(DEFAULT_PORT);
+		 iPort = std::stoi(sPort);
+		 Server.maxClients = MAX_CLIENTS;
+		 m_savedFps = SCREEN_STREAM_FPS;
+		 m_savedAlwaysOnTop = false;
+		 m_savedWinW = 477;
+		 m_savedWinH = 340;
+		 std::fstream f(configName, std::fstream::in);
+		 if (!f.is_open())
+		 {
+			 return false;
+		 }
 
-	std::string line;
-	std::string param;
-	std::stringstream s;
+		 std::string line;
+		 std::string param;
+		 std::stringstream s;
 
-	if (!f.eof()) // read the port
-	{
-		std::getline(f, line);
-		s << line;
-		s >> param >> sPort;
+		 while (std::getline(f, line))
+		 {
+			 s.clear();
+			 s.str(line);
+			 s >> param;
+			 if (param == "port") {
+				 s >> sPort;
+			 }
+			 else if (param == "server_ip") {
+				 s >> Client.ip;
+			 }
+			 else if (param == "max_clients") {
+				 std::string max;
+				 s >> max;
+				 Server.maxClients = std::stoi(max);
+			 }
+			 else if (param == "fps") {
+				 int fps;
+				 s >> fps;
+				 if (fps >= 5 && fps <= 60) {
+					 m_savedFps = fps;
+					 g_streamingFps = fps;
+					 g_screenStreamMenuFps = fps;
+					 g_screenStreamActualFps = fps;
+				 }
+			 }
+			 else if (param == "always_on_top") {
+				 int atop = 0;
+				 s >> atop;
+				 m_savedAlwaysOnTop = (atop != 0);
+				 g_alwaysOnTop = m_savedAlwaysOnTop;
+			 }
+			 else if (param == "window_size") {
+				 int w = 477, h = 340;
+				 s >> w >> h;
+				 if (w > 100 && h > 100) {
+					 m_savedWinW = w;
+					 m_savedWinH = h;
+				 }
+			 }
+		 }
 
-		s.clear();
-	}
+		 std::cout << "Config Loaded:\n"
+			 << "    port = " << sPort << '\n'
+			 << "    server ip = " << Client.ip << '\n'
+			 << "    max number clients = " << Server.maxClients << std::endl
+			 << "    fps = " << m_savedFps << std::endl
+			 << "    always_on_top = " << (m_savedAlwaysOnTop ? "true" : "false") << std::endl
+			 << "    window size = " << m_savedWinW << "x" << m_savedWinH << std::endl;
 
-	if (!f.eof()) // read the server ip
-	{
-		std::getline(f, line);
-		s << line;
-		s >> param >> Client.ip;
-		s.clear();
-	}
+		 f.close();
+		 return true;
+	 }
 
-	if (!f.eof()) // read the max client number
-	{
-		std::getline(f, line);
-		s << line;
-		std::string max;
-		s >> param >> max;
-		Server.maxClients = std::stoi(max);
-		s.clear();
-	}
-
-	std::cout << "Config Loaded:\n"
-		<< "    port = " << sPort << '\n'
-		<< "    server ip = " << Client.ip << '\n'
-		<< "    max number clients = " << Server.maxClients << std::endl;
-
-	f.close();
-
-	return true;
-}
 
 int main()
 {
