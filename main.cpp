@@ -50,6 +50,136 @@ extern MainWindow* g_pMainWindow;
 #define MENU_SUB 11
 #define MENU_EXIT 12
 #define MENU_ABOUT 13
+// --- Context menu command IDs for the remote screen window ---
+#define IDM_VIDEO_QUALITY     6001
+#define IDM_VIDEO_QUALITY_1   6002
+#define IDM_VIDEO_QUALITY_2   6003
+#define IDM_VIDEO_QUALITY_3   6004
+#define IDM_VIDEO_QUALITY_4   6005
+
+#define IDM_VIDEO_FPS         6010
+#define IDM_VIDEO_FPS_5       6011
+#define IDM_VIDEO_FPS_10      6012
+#define IDM_VIDEO_FPS_20      6013
+#define IDM_VIDEO_FPS_30      6014
+#define IDM_VIDEO_FPS_40      6015
+#define IDM_VIDEO_FPS_60      6016
+
+#define IDM_ALWAYS_ON_TOP     6020
+
+#define IDM_SENDKEYS          6030
+#define IDM_SENDKEYS_ALTF4    6031
+#define IDM_SENDKEYS_CTRLESC  6032
+#define IDM_SENDKEYS_CTRALTDEL 6033
+#define IDM_SENDKEYS_PRNTSCRN 6034
+
+// --- State variables for menu ---
+static bool g_alwaysOnTop = false;
+static int g_screenStreamMenuQuality = SCREEN_STREAM_QUALITY / 20; // 1-4 (default 3)
+static int g_screenStreamMenuFps = SCREEN_STREAM_FPS; // 5, 10, 20, 30, 40, 60
+static int g_screenStreamActualQuality = SCREEN_STREAM_QUALITY;
+static int g_screenStreamActualFps = SCREEN_STREAM_FPS;
+
+// --- Function prototypes for menu logic ---
+HMENU CreateScreenContextMenu();
+void SetRemoteScreenQuality(HWND hwnd, int qualityLevel);
+void SetRemoteScreenFps(HWND hwnd, int fps);
+void SendRemoteKeyCombo(HWND hwnd, int combo);
+
+// --- Helper for context menu creation ---
+HMENU CreateScreenContextMenu() {
+	HMENU hMenu = CreatePopupMenu();
+
+	// Video Quality submenu (choose levels 1-4)
+	HMENU hQualityMenu = CreatePopupMenu();
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 1 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_1, "1 (Low)");
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 2 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_2, "2");
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 3 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_3, "3");
+	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 4 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_4, "4 (High)");
+	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hQualityMenu, "Video Quality");
+
+	// Video FPS submenu
+	HMENU hFpsMenu = CreatePopupMenu();
+	const int fpsVals[] = { 5, 10, 20, 30, 40, 60 };
+	const int fpsIDs[] = { IDM_VIDEO_FPS_5, IDM_VIDEO_FPS_10, IDM_VIDEO_FPS_20, IDM_VIDEO_FPS_30, IDM_VIDEO_FPS_40, IDM_VIDEO_FPS_60 };
+	for (int i = 0; i < 6; ++i) {
+		AppendMenuA(hFpsMenu, MF_STRING | (g_screenStreamMenuFps == fpsVals[i] ? MF_CHECKED : 0), fpsIDs[i], std::to_string(fpsVals[i]).c_str());
+	}
+	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFpsMenu, "Video FPS");
+
+	// Always On Top
+	AppendMenuA(hMenu, MF_STRING | (g_alwaysOnTop ? MF_CHECKED : 0), IDM_ALWAYS_ON_TOP, "Always On Top");
+
+	// Send Keys submenu
+	HMENU hSendKeysMenu = CreatePopupMenu();
+	AppendMenuA(hSendKeysMenu, MF_STRING, IDM_SENDKEYS_ALTF4, "Alt + F4");
+	AppendMenuA(hSendKeysMenu, MF_STRING, IDM_SENDKEYS_CTRLESC, "Ctrl + Esc");
+	AppendMenuA(hSendKeysMenu, MF_STRING, IDM_SENDKEYS_CTRALTDEL, "Ctrl + Alt + Del");
+	AppendMenuA(hSendKeysMenu, MF_STRING, IDM_SENDKEYS_PRNTSCRN, "PrintScreen");
+	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hSendKeysMenu, "Send Keys");
+
+	return hMenu;
+}
+
+// --- Helpers for setting quality/fps and sending keys ---
+// These are called from the context menu handler.
+
+void SetRemoteScreenQuality(HWND hwnd, int qualityLevel) {
+	// Translate level 1-4 to actual JPEG quality (20, 40, 60, 80)
+	static const int levels[] = { 0, 20, 40, 60, 80 };
+	g_screenStreamMenuQuality = qualityLevel;
+	g_screenStreamActualQuality = levels[qualityLevel];
+	// Send a custom message to the server streaming thread if needed
+	// This is a simple way: store the value in a global variable
+	// If you have a streaming thread object, signal it to update quality
+}
+
+void SetRemoteScreenFps(HWND hwnd, int fps) {
+	g_screenStreamMenuFps = fps;
+	g_screenStreamActualFps = fps;
+	// Again: signal streaming thread to update FPS if needed
+}
+
+// This helper sends special key combos to the remote side
+void SendRemoteKeyCombo(HWND hwnd, int combo) {
+	// Find the input socket for this window
+	SOCKET* psktInput = nullptr;
+	// The input socket pointer is stored with WM_USER + 100
+	// (see logic in ScreenWndProc and StartScreenRecv)
+	psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+	if (!psktInput || *psktInput == INVALID_SOCKET) return;
+
+	INPUT input[6] = {};
+	int n = 0;
+	switch (combo) {
+	case IDM_SENDKEYS_ALTF4:
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_MENU; n++;
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_F4; n++;
+		input[n] = input[n - 1]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		input[n] = input[n - 3]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		break;
+	case IDM_SENDKEYS_CTRLESC:
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_CONTROL; n++;
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_ESCAPE; n++;
+		input[n] = input[n - 1]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		input[n] = input[n - 3]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		break;
+	case IDM_SENDKEYS_CTRALTDEL:
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_CONTROL; n++;
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_MENU; n++;
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_DELETE; n++;
+		input[n] = input[n - 1]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		input[n] = input[n - 2]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		input[n] = input[n - 3]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		break;
+	case IDM_SENDKEYS_PRNTSCRN:
+		input[n] = {}; input[n].type = INPUT_KEYBOARD; input[n].ki.wVk = VK_SNAPSHOT; n++;
+		input[n] = input[n - 1]; input[n].ki.dwFlags = KEYEVENTF_KEYUP; n++;
+		break;
+	}
+	for (int i = 0; i < n; ++i)
+		send(*psktInput, (char*)&input[i], sizeof(INPUT), 0);
+}
 
 #define DEFAULT_PORT 27015
 #define MAX_CLIENTS 10
@@ -356,8 +486,8 @@ std::atomic<int> g_screenStreamH(0);
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 	int width = 0, height = 0;
-	int fps = SCREEN_STREAM_FPS;
-	int quality = SCREEN_STREAM_QUALITY;
+	int fps = g_screenStreamActualFps;
+	int quality = g_screenStreamActualQuality;
 	int frameInterval = 1000 / fps;
 
 	g_screenStreamActive = true;
@@ -369,6 +499,10 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	size_t bytes = 0;
 
 	while (g_screenStreamActive) {
+		fps = g_screenStreamActualFps;
+		quality = g_screenStreamActualQuality;
+		frameInterval = 1000 / fps;
+
 		auto start = steady_clock::now();
 		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
 		std::vector<BYTE> jpgBuffer;
@@ -409,16 +543,18 @@ END:
 	g_screenStreamActive = false;
 }
 
+
 // ============ SCREEN STREAM CLIENT WINDOW ============
 
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	static HBITMAP hBitmap = NULL;
 	static int imgW = 0, imgH = 0;
-	// --- Add static for input socket reuse ---
 	static SOCKET* psktInput = nullptr;
+
 	switch (msg) {
-	case WM_USER + 100: // Custom message to set the input socket (see StartScreenRecv)
+	case WM_USER + 100: // Store input socket pointer
 		psktInput = (SOCKET*)lParam;
+		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)psktInput);
 		return 0;
 	case WM_USER + 1: {
 		if (hBitmap) DeleteObject(hBitmap);
@@ -428,10 +564,53 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		InvalidateRect(hwnd, NULL, FALSE);
 		break;
 	}
-	case WM_USER + 2: {
+	case WM_USER + 2:
 		SetWindowTextA(hwnd, (const char*)lParam);
 		break;
+		// --- Context menu handling ---
+	case WM_CONTEXTMENU: {
+		POINT pt;
+		pt.x = LOWORD(lParam);
+		pt.y = HIWORD(lParam);
+		if (pt.x == -1 && pt.y == -1) {
+			RECT rect;
+			GetWindowRect(hwnd, &rect);
+			pt.x = rect.left + (rect.right - rect.left) / 2;
+			pt.y = rect.top + (rect.bottom - rect.top) / 2;
+		}
+		HMENU hMenu = CreateScreenContextMenu();
+		int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
+		if (cmd)
+			PostMessage(hwnd, WM_COMMAND, cmd, 0);
+		DestroyMenu(hMenu);
+		break;
 	}
+	case WM_COMMAND:
+		switch (LOWORD(wParam)) {
+			// Video Quality
+		case IDM_VIDEO_QUALITY_1: SetRemoteScreenQuality(hwnd, 1); break;
+		case IDM_VIDEO_QUALITY_2: SetRemoteScreenQuality(hwnd, 2); break;
+		case IDM_VIDEO_QUALITY_3: SetRemoteScreenQuality(hwnd, 3); break;
+		case IDM_VIDEO_QUALITY_4: SetRemoteScreenQuality(hwnd, 4); break;
+			// Video FPS
+		case IDM_VIDEO_FPS_5: SetRemoteScreenFps(hwnd, 5); break;
+		case IDM_VIDEO_FPS_10: SetRemoteScreenFps(hwnd, 10); break;
+		case IDM_VIDEO_FPS_20: SetRemoteScreenFps(hwnd, 20); break;
+		case IDM_VIDEO_FPS_30: SetRemoteScreenFps(hwnd, 30); break;
+		case IDM_VIDEO_FPS_40: SetRemoteScreenFps(hwnd, 40); break;
+		case IDM_VIDEO_FPS_60: SetRemoteScreenFps(hwnd, 60); break;
+			// Always On Top
+		case IDM_ALWAYS_ON_TOP:
+			g_alwaysOnTop = !g_alwaysOnTop;
+			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+			break;
+			// Send Keys
+		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
+		case IDM_SENDKEYS_CTRLESC:  SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRLESC); break;
+		case IDM_SENDKEYS_CTRALTDEL:SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRALTDEL); break;
+		case IDM_SENDKEYS_PRNTSCRN: SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_PRNTSCRN); break;
+		}
+		break;
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONUP:
 	case WM_RBUTTONDOWN:
