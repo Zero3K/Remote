@@ -23,10 +23,13 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="includes\qoi.h">
+    <ClInclude Include="includes\BasicBitmap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="includes\BasicBitmap.h">
+    <ClInclude Include="qoi\qoi.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="includes\xrle.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

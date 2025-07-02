@@ -23,6 +23,8 @@
 #include <objidl.h>
 #include "qoi.h"
 #include "BasicBitmap.h"
+#include "xrle.h"
+#include "xrle.c"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -609,7 +611,20 @@ int CloseConnection(SOCKET* sktConn) {
 
 // =================== SCREEN STREAM SERVER =====================
 
-// Optimized server thread: no whole-frame memcpy, uses row-by-row memcmp for dirty tile detection.
+// --- Optimized server thread: now uses XRLE for dirty bitmask and QOI tiles ---
+// Uncomment this line for verbose debug output on the server
+//#define SCREENSTREAMSERVER_DEBUG
+
+#ifdef SCREENSTREAMSERVER_DEBUG
+#define SSDPRINTF(...)        \
+    do {                      \
+        printf(__VA_ARGS__);  \
+        fflush(stdout);       \
+    } while (0)
+#else
+#define SSDPRINTF(...) do {} while (0)
+#endif
+
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 
@@ -626,12 +641,27 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	g_screenStreamBytes = 0;
 	g_screenStreamFPS = 0;
 
+	// --- CAPTURE SCREEN ONCE TO GET SIZE ---
+	BasicBitmap* pTmpBmp = nullptr;
+	while (!pTmpBmp) {
+		CaptureScreenToBasicBitmap(pTmpBmp);
+	}
+	int screen_width = pTmpBmp->Width();
+	int screen_height = pTmpBmp->Height();
+	delete pTmpBmp;
+
+	// --- SEND WIDTH/HEIGHT TO CLIENT BEFORE MAIN LOOP ---
+	uint32_t widthNet = htonl((uint32_t)screen_width);
+	uint32_t heightNet = htonl((uint32_t)screen_height);
+	send(sktClient, (const char*)&widthNet, 4, 0);
+	send(sktClient, (const char*)&heightNet, 4, 0);
+	SSDPRINTF("ScreenStreamServerThread: sent initial screen size %dx%d\n", screen_width, screen_height);
+
 	while (g_screenStreamActive) {
 		int fps = g_streamingFps.load();
 		int frameInterval = 1000 / fps;
 		auto start = steady_clock::now();
 
-		// --- Capture into a new BasicBitmap ---
 		BasicBitmap* pBmp = nullptr;
 		if (!CaptureScreenToBasicBitmap(pBmp)) continue;
 		currBmp.reset(pBmp);
@@ -641,24 +671,33 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		int height = currBmp->Height();
 		const uint8_t* curr_rgba = currBmp->Bits();
 
-		std::vector<DirtyTile> DirtyTiles;
+		size_t tiles_x = (width + TILE_W - 1) / TILE_W;
+		size_t tiles_y = (height + TILE_H - 1) / TILE_H;
+		size_t numTiles = tiles_x * tiles_y;
+
+		// --- Compute dirty bitmask and tile list ---
+		std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8, 0);
+		std::vector<std::pair<int, int>> DirtyTileIndices;
+
 		frameCounter++;
 		if (first || frameCounter % 60 == 0) {
-			DirtyTiles.clear();
-			DirtyTiles.push_back({ 0, 0, width, height });
+			// Force full refresh periodically
+			for (size_t ty = 0; ty < tiles_y; ++ty)
+				for (size_t tx = 0; tx < tiles_x; ++tx) {
+					size_t tidx = ty * tiles_x + tx;
+					dirtyBitmask[tidx / 8] |= 1 << (tidx % 8);
+					DirtyTileIndices.push_back({ (int)tx, (int)ty });
+				}
 			prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 			first = false;
 		}
 		else {
 			if (prevBmp && prevBmp->Width() == width && prevBmp->Height() == height) {
-				// --- Optimized dirty tile detection: row-by-row memcmp, no frame memcpy ---
 				const uint8_t* prev = prevBmp->Bits();
-				size_t tiles_x = (width + TILE_W - 1) / TILE_W;
-				size_t tiles_y = (height + TILE_H - 1) / TILE_H;
 				for (size_t ty = 0; ty < tiles_y; ++ty) {
 					for (size_t tx = 0; tx < tiles_x; ++tx) {
-						int tileLeft = tx * TILE_W;
-						int tileTop = ty * TILE_H;
+						int tileLeft = (int)(tx * TILE_W);
+						int tileTop = (int)(ty * TILE_H);
 						int tileW = std::min(TILE_W, width - tileLeft);
 						int tileH = std::min(TILE_H, height - tileTop);
 						bool dirty = false;
@@ -672,54 +711,99 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 							}
 						}
 						if (dirty) {
-							DirtyTiles.push_back({ tileLeft, tileTop, tileLeft + tileW, tileTop + tileH });
+							size_t tidx = ty * tiles_x + tx;
+							dirtyBitmask[tidx / 8] |= 1 << (tidx % 8);
+							DirtyTileIndices.push_back({ (int)tx, (int)ty });
 						}
 					}
 				}
+				if (DirtyTileIndices.empty()) {
+					SSDPRINTF("ScreenStreamServerThread: No dirty tiles detected in this frame!\n");
+				}
 			}
 			else {
-				DirtyTiles.clear();
-				DirtyTiles.push_back({ 0, 0, width, height });
+				// Fallback: screen size changed, force full refresh
+				for (size_t ty = 0; ty < tiles_y; ++ty)
+					for (size_t tx = 0; tx < tiles_x; ++tx) {
+						size_t tidx = ty * tiles_x + tx;
+						dirtyBitmask[tidx / 8] |= 1 << (tidx % 8);
+						DirtyTileIndices.push_back({ (int)tx, (int)ty });
+					}
 			}
 		}
 
-		uint32_t nTiles = (uint32_t)DirtyTiles.size();
-		uint32_t nTilesNet = htonl(nTiles);
-		int ret = send(sktClient, (const char*)&nTilesNet, sizeof(nTilesNet), 0);
-		if (ret != sizeof(nTilesNet)) break;
+		// --- Debug output: tiles and bitmask ---
+		SSDPRINTF("ScreenStreamServerThread: width=%d height=%d tiles_x=%zu tiles_y=%zu numTiles=%zu dirtyTiles=%zu\n",
+			width, height, tiles_x, tiles_y, numTiles, DirtyTileIndices.size());
+		for (auto& idx : DirtyTileIndices)
+			SSDPRINTF("ScreenStreamServerThread: Dirty tile tx=%d ty=%d\n", idx.first, idx.second);
+		SSDPRINTF("ScreenStreamServerThread: DirtyBitmask: ");
+		for (size_t b = 0; b < dirtyBitmask.size(); ++b)
+			SSDPRINTF("%02X", dirtyBitmask[b]);
+		SSDPRINTF("\n");
 
-		for (const auto& r : DirtyTiles) {
-			int rw = r.right - r.left, rh = r.bottom - r.top;
-			BasicBitmap tile(rw, rh, BasicBitmap::A8R8G8B8);
-			for (int row = 0; row < rh; ++row) {
-				const uint8_t* src = curr_rgba + ((r.top + row) * width + r.left) * 4;
-				uint8_t* dst = tile.Bits() + row * rw * 4;
-				memcpy(dst, src, rw * 4);
+		// --- XRLE compress and send the dirty tile bitmask ---
+		std::vector<uint8_t> xrleBitmask(std::max<size_t>(1, dirtyBitmask.size() * 2));
+		size_t xrleBitmaskLen = xrle_compress(xrleBitmask.data(), dirtyBitmask.data(), dirtyBitmask.size());
+		xrleBitmask.resize(xrleBitmaskLen);
+		// Send the bitmask length and data
+		uint32_t xrleBitmaskLenNet = htonl((uint32_t)xrleBitmaskLen);
+		send(sktClient, (const char*)&xrleBitmaskLenNet, 4, 0);
+		if (xrleBitmaskLen > 0)
+			send(sktClient, (const char*)xrleBitmask.data(), xrleBitmaskLen, 0);
+
+		// --- Send number of dirty tiles ---
+		uint32_t nTilesNet = htonl((uint32_t)DirtyTileIndices.size());
+		send(sktClient, (const char*)&nTilesNet, 4, 0);
+
+		// --- Send all dirty tiles in grid order ---
+		size_t tileSeq = 0;
+		for (const auto& idx : DirtyTileIndices) {
+			int tx = idx.first, ty = idx.second;
+			int tileLeft = tx * TILE_W;
+			int tileTop = ty * TILE_H;
+			int tileW = std::min(TILE_W, width - tileLeft);
+			int tileH = std::min(TILE_H, height - tileTop);
+
+			BasicBitmap tile(tileW, tileH, BasicBitmap::A8R8G8B8);
+			for (int row = 0; row < tileH; ++row) {
+				const uint8_t* src = curr_rgba + ((tileTop + row) * width + tileLeft) * 4;
+				uint8_t* dst = tile.Bits() + row * tileW * 4;
+				memcpy(dst, src, tileW * 4);
 			}
 			std::vector<uint8_t> qoiData;
 			QOIEncodeBasicBitmap(&tile, qoiData);
 
-			uint32_t xNet = htonl(r.left);
-			uint32_t yNet = htonl(r.top);
-			uint32_t wNet = htonl(rw);
-			uint32_t hNet = htonl(rh);
-			uint32_t qoiLenNet = htonl((uint32_t)qoiData.size());
+			std::vector<uint8_t> xrleData(std::max<size_t>(1, qoiData.size() * 2));
+			size_t xrleSize = xrle_compress(xrleData.data(), qoiData.data(), qoiData.size());
+			xrleData.resize(xrleSize);
+
+			uint32_t xNet = htonl(tileLeft);
+			uint32_t yNet = htonl(tileTop);
+			uint32_t wNet = htonl(tileW);
+			uint32_t hNet = htonl(tileH);
+			uint32_t xrleLenNet = htonl((uint32_t)xrleData.size());
+			uint32_t qoiOrigLenNet = htonl((uint32_t)qoiData.size());
+
+			SSDPRINTF("ScreenStreamServerThread: Sending tile #%zu at (%d,%d) size %dx%d, xrleSize=%zu, qoiSize=%zu\n",
+				tileSeq, tileLeft, tileTop, tileW, tileH, xrleData.size(), qoiData.size());
 
 			send(sktClient, (const char*)&xNet, 4, 0);
 			send(sktClient, (const char*)&yNet, 4, 0);
 			send(sktClient, (const char*)&wNet, 4, 0);
 			send(sktClient, (const char*)&hNet, 4, 0);
-			send(sktClient, (const char*)&qoiLenNet, 4, 0);
+			send(sktClient, (const char*)&xrleLenNet, 4, 0);
+			send(sktClient, (const char*)&qoiOrigLenNet, 4, 0);
 
 			size_t offset = 0;
-			while (offset < qoiData.size()) {
-				int sent = send(sktClient, (const char*)(qoiData.data() + offset), qoiData.size() - offset, 0);
+			while (offset < xrleData.size()) {
+				int sent = send(sktClient, (const char*)(xrleData.data() + offset), xrleData.size() - offset, 0);
 				if (sent <= 0) goto END;
 				offset += sent;
 			}
-			bytes += qoiData.size() + 20;
+			bytes += xrleData.size() + 24;
+			tileSeq++;
 		}
-		// Only update prevBmp after sending tiles
 		prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 
 		frames++;
@@ -739,7 +823,9 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 END:
 	closesocket(sktClient);
 	g_screenStreamActive = false;
+	SSDPRINTF("ScreenStreamServerThread: closesocket, exiting thread\n");
 }
+
 
 
 
@@ -747,67 +833,207 @@ END:
 // Store a pointer to this struct in the window's GWLP_USERDATA
 // You must set this on window creation.
 
-// --- Client streaming: receive tiles, patch framebuffer using BasicBitmap ---
+// --- Client streaming: receive XRLE bitmask and XRLE tiles ---
+// Uncomment this line for verbose debug output
+//#define SCREENRECV_DEBUG
+
+#ifdef SCREENRECV_DEBUG
+#define SRDPRINTF(...)        \
+    do {                      \
+        printf(__VA_ARGS__);  \
+        fflush(stdout);       \
+    } while (0)
+#else
+#define SRDPRINTF(...) do {} while (0)
+#endif
+
 void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	using namespace std::chrono;
+	SRDPRINTF("ScreenRecvThread: started\n");
+
+	// --- RECEIVE WIDTH/HEIGHT FROM SERVER ---
+	uint32_t widthNet = 0, heightNet = 0;
+	int got = recv(skt, (char*)&widthNet, 4, MSG_WAITALL);
+	if (got != 4) {
+		SRDPRINTF("ScreenRecvThread: recv for width failed, got=%d\n", got);
+		closesocket(skt);
+		return;
+	}
+	got = recv(skt, (char*)&heightNet, 4, MSG_WAITALL);
+	if (got != 4) {
+		SRDPRINTF("ScreenRecvThread: recv for height failed, got=%d\n", got);
+		closesocket(skt);
+		return;
+	}
+	g_screenStreamW = ntohl(widthNet);
+	g_screenStreamH = ntohl(heightNet);
+	SRDPRINTF("ScreenRecvThread: received screen size: %dx%d\n", g_screenStreamW.load(), g_screenStreamH.load());
+
 	size_t bytesLastSec = 0;
 	int framesLastSec = 0;
 	auto lastSec = steady_clock::now();
 
 	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 	if (!bmpState) {
+		SRDPRINTF("ScreenRecvThread: bmpState is NULL, exiting\n");
 		closesocket(skt);
 		return;
 	}
 
 	std::vector<RECT> invalidateRects;
-	std::vector<uint8_t> qoiData; // reused for each tile
-
+	std::vector<uint8_t> qoiData;
 	bool running = true;
+
 	while (running) {
+		uint32_t xrleBitmaskLenNet = 0;
+		int ret = recv(skt, (char*)&xrleBitmaskLenNet, 4, MSG_WAITALL);
+		if (ret != 4) {
+			SRDPRINTF("ScreenRecvThread: recv for bitmask length failed, ret=%d\n", ret);
+			break;
+		}
+		uint32_t xrleBitmaskLen = ntohl(xrleBitmaskLenNet);
+		SRDPRINTF("ScreenRecvThread: xrleBitmaskLen = %u\n", xrleBitmaskLen);
+
+		if (xrleBitmaskLen == 0 || xrleBitmaskLen > 1024 * 1024) {
+			SRDPRINTF("ScreenRecvThread: xrleBitmaskLen out of range, exiting\n");
+			break;
+		}
+
+		std::vector<uint8_t> xrleBitmask(xrleBitmaskLen);
+		size_t offset = 0;
+		while (offset < xrleBitmaskLen) {
+			int got = recv(skt, (char*)(xrleBitmask.data() + offset), xrleBitmaskLen - offset, 0);
+			if (got <= 0) {
+				SRDPRINTF("ScreenRecvThread: recv for xrleBitmask data failed, got=%d offset=%zu\n", got, offset);
+				running = false;
+				break;
+			}
+			offset += got;
+		}
+		if (!running) {
+			SRDPRINTF("ScreenRecvThread: !running after xrleBitmask\n");
+			break;
+		}
+
+		int width = g_screenStreamW.load();
+		int height = g_screenStreamH.load();
+		SRDPRINTF("ScreenRecvThread: width=%d height=%d\n", width, height);
+		if (width <= 0 || height <= 0) {
+			SRDPRINTF("ScreenRecvThread: Invalid width/height, exiting\n");
+			break;
+		}
+
+		size_t tiles_x = (width + TILE_W - 1) / TILE_W;
+		size_t tiles_y = (height + TILE_H - 1) / TILE_H;
+		size_t numTiles = tiles_x * tiles_y;
+		if (numTiles == 0 || numTiles > 100000) {
+			SRDPRINTF("ScreenRecvThread: numTiles out of range (%zu), exiting\n", numTiles);
+			break;
+		}
+
+		std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8);
+		size_t gotLen = xrle_decompress(dirtyBitmask.data(), xrleBitmask.data(), xrleBitmask.size());
+		SRDPRINTF("ScreenRecvThread: gotLen from xrle_decompress = %zu, expected = %zu\n", gotLen, dirtyBitmask.size());
+		if (gotLen != dirtyBitmask.size()) {
+			SRDPRINTF("ScreenRecvThread: xrle_decompress size mismatch, exiting\n");
+			break;
+		}
+
+		size_t dirtyCount = 0;
+		SRDPRINTF("ScreenRecvThread: tiles_x=%zu tiles_y=%zu numTiles=%zu\n", tiles_x, tiles_y, numTiles);
+		SRDPRINTF("ScreenRecvThread: DirtyBitmask: ");
+		for (size_t b = 0; b < dirtyBitmask.size(); ++b) {
+			SRDPRINTF("%02X", dirtyBitmask[b]);
+			for (int bit = 0; bit < 8; ++bit)
+				if (dirtyBitmask[b] & (1 << bit))
+					dirtyCount++;
+		}
+		SRDPRINTF("\nScreenRecvThread: dirtyCount=%zu\n", dirtyCount);
+
 		uint32_t nTilesNet = 0;
-		int ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
-		if (ret != 4) break;
+		ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
+		if (ret != 4) {
+			SRDPRINTF("ScreenRecvThread: recv for nTiles failed, ret=%d\n", ret);
+			break;
+		}
 		uint32_t nTiles = ntohl(nTilesNet);
-		if (nTiles == 0) continue;
+		SRDPRINTF("ScreenRecvThread: nTiles (server says) = %u\n", nTiles);
+
 		size_t bytesThisFrame = 4;
 		bool frame_error = false, fullScreenInvalidation = false;
 		invalidateRects.clear();
 
-		for (uint32_t i = 0; i < nTiles; ++i) {
-			uint32_t x, y, w, h, qoiLen;
-			int got;
-			got = recv(skt, (char*)&x, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&y, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&w, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&h, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&qoiLen, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
-			bytesThisFrame += 4 * 5;
-			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
+		size_t receivedDirty = 0;
+		for (size_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+			if (!(dirtyBitmask[tileIdx / 8] & (1 << (tileIdx % 8))))
+				continue;
 
-			// --- Reuse qoiData buffer ---
-			qoiData.resize(qoiLen);
-			size_t offset = 0;
-			while (offset < qoiLen) {
-				got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
-				if (got <= 0) { frame_error = true; running = false; break; }
-				offset += got;
+			size_t tx = tileIdx % tiles_x;
+			size_t ty = tileIdx / tiles_x;
+			uint32_t x = static_cast<uint32_t>(tx * TILE_W);
+			uint32_t y = static_cast<uint32_t>(ty * TILE_H);
+			uint32_t w = std::min<uint32_t>(TILE_W, static_cast<uint32_t>(std::max(0, width - (int)x)));
+			uint32_t h = std::min<uint32_t>(TILE_H, static_cast<uint32_t>(std::max(0, height - (int)y)));
+
+			SRDPRINTF("ScreenRecvThread: expecting tile #%zu at grid (%zu,%zu) x=%u y=%u w=%u h=%u\n",
+				receivedDirty, tx, ty, x, y, w, h);
+
+			uint32_t rx, ry, rw, rh, xrleLen, qoiOrigLen;
+			int got;
+			got = recv(skt, (char*)&rx, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rx failed, got=%d\n", got); frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&ry, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv ry failed, got=%d\n", got); frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&rw, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rw failed, got=%d\n", got); frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&rh, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rh failed, got=%d\n", got); frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&xrleLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv xrleLen failed, got=%d\n", got); frame_error = true; running = false; break; }
+			got = recv(skt, (char*)&qoiOrigLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv qoiOrigLen failed, got=%d\n", got); frame_error = true; running = false; break; }
+			bytesThisFrame += 4 * 6;
+			rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh); xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
+
+			SRDPRINTF("ScreenRecvThread: received header for tile #%zu: rx=%u ry=%u rw=%u rh=%u xrleLen=%u qoiOrigLen=%u\n",
+				receivedDirty, rx, ry, rw, rh, xrleLen, qoiOrigLen);
+
+			if (rw == 0 || rh == 0 || xrleLen == 0 || qoiOrigLen == 0) {
+				SRDPRINTF("ScreenRecvThread: zero/invalid header value, frame_error\n");
+				frame_error = true; running = false; break;
+			}
+
+			std::vector<uint8_t> xrleData(xrleLen);
+			size_t offset2 = 0;
+			while (offset2 < xrleLen) {
+				got = recv(skt, (char*)(xrleData.data() + offset2), xrleLen - offset2, 0);
+				if (got <= 0) {
+					SRDPRINTF("ScreenRecvThread: recv for xrleData failed, got=%d offset2=%zu\n", got, offset2);
+					frame_error = true; running = false; break;
+				}
+				offset2 += got;
 				bytesThisFrame += got;
 			}
-			if (!running) break;
+			if (!running) {
+				SRDPRINTF("ScreenRecvThread: !running after tile data\n");
+				break;
+			}
 
-			// --- Use unique_ptr for tileBmp, correct object management ---
+			qoiData.resize(qoiOrigLen);
+			size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
+			if (qoiLen != qoiOrigLen) {
+				SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
+				frame_error = true; running = false; break;
+			}
+			qoiData.resize(qoiLen);
+
 			std::unique_ptr<BasicBitmap> tileBmp;
 			{
 				BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
-				if (!decoded) continue;
+				if (!decoded) {
+					SRDPRINTF("ScreenRecvThread: QOIDecodeToBasicBitmap failed for tile #%zu\n", receivedDirty);
+					continue;
+				}
 				tileBmp.reset(decoded);
 			}
 
-			// --- Patch tile into window's BasicBitmap framebuffer ---
 			EnterCriticalSection(&bmpState->cs);
-			int needW = std::max(bmpState->imgW, (int)(x + w));
-			int needH = std::max(bmpState->imgH, (int)(y + h));
+			int needW = std::max(bmpState->imgW, (int)(rx + rw));
+			int needH = std::max(bmpState->imgH, (int)(ry + rh));
 			bool needRealloc = (bmpState->bmp == nullptr) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
 			if (needRealloc) {
 				if (bmpState->bmp) delete bmpState->bmp;
@@ -815,35 +1041,45 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				bmpState->imgW = needW;
 				bmpState->imgH = needH;
 			}
-			for (uint32_t row = 0; row < h; ++row) {
-				if ((y + row) >= (uint32_t)bmpState->imgH || x >= (uint32_t)bmpState->imgW) continue;
-				uint8_t* dst = bmpState->bmp->Bits() + ((y + row) * bmpState->imgW + x) * 4;
-				uint8_t* src = tileBmp->Bits() + row * w * 4;
-				memcpy(dst, src, w * 4);
+			for (uint32_t row = 0; row < rh; ++row) {
+				if ((ry + row) >= (uint32_t)bmpState->imgH || rx >= (uint32_t)bmpState->imgW) continue;
+				uint8_t* dst = bmpState->bmp->Bits() + ((ry + row) * bmpState->imgW + rx) * 4;
+				uint8_t* src = tileBmp->Bits() + row * rw * 4;
+				memcpy(dst, src, rw * 4);
 			}
-			if (x == 0 && y == 0 && w == (uint32_t)bmpState->imgW && h == (uint32_t)bmpState->imgH) {
+			if (rx == 0 && ry == 0 && rw == (uint32_t)bmpState->imgW && rh == (uint32_t)bmpState->imgH) {
 				fullScreenInvalidation = true;
 			}
 			else {
 				RECT tileRect;
-				tileRect.left = x;
-				tileRect.top = y;
-				tileRect.right = x + w;
-				tileRect.bottom = y + h;
+				tileRect.left = rx;
+				tileRect.top = ry;
+				tileRect.right = rx + rw;
+				tileRect.bottom = ry + rh;
 				invalidateRects.push_back(tileRect);
 			}
 			LeaveCriticalSection(&bmpState->cs);
+
+			SRDPRINTF("ScreenRecvThread: painted tile #%zu at %u,%u size %u,%u\n", receivedDirty, rx, ry, rw, rh);
+
+			receivedDirty++;
 		}
+		SRDPRINTF("ScreenRecvThread: received %zu dirty tiles for %zu dirty bits\n", receivedDirty, dirtyCount);
 
 		if (fullScreenInvalidation) {
 			InvalidateRect(hwnd, NULL, FALSE);
+			SRDPRINTF("ScreenRecvThread: InvalidateRect(NULL)\n");
 		}
 		else {
 			for (const RECT& r : invalidateRects) {
 				InvalidateRect(hwnd, &r, FALSE);
+				SRDPRINTF("ScreenRecvThread: InvalidateRect(%ld,%ld,%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
 			}
 		}
-		if (frame_error) break;
+		if (frame_error) {
+			SRDPRINTF("ScreenRecvThread: frame_error, breaking\n");
+			break;
+		}
 		framesLastSec++;
 		bytesLastSec += bytesThisFrame;
 		auto now = steady_clock::now();
@@ -857,12 +1093,16 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			snprintf(title, sizeof(title), "Remote Screen | IP: %s | FPS: %d | Mbps: %.2f | Size: %dx%d",
 				ip.c_str(), framesLastSec, mbps, winW, winH);
 			PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
+			SRDPRINTF("ScreenRecvThread: Updated window title\n");
 			bytesLastSec = 0;
 			framesLastSec = 0;
 			lastSec = now;
 		}
 	}
+	closesocket(skt);
+	SRDPRINTF("ScreenRecvThread: closesocket, exiting thread\n");
 }
+
 
 
 
