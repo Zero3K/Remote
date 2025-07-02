@@ -18,12 +18,15 @@
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="BasicBitmap\BasicBitmap.cpp">
+    <ClCompile Include="includes\BasicBitmap.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="qoi\qoi.h">
+    <ClInclude Include="includes\qoi.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="includes\BasicBitmap.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
