@@ -1378,12 +1378,12 @@ public:
 	void Log(std::string msg);
 	void ServerLog(std::string msg);
 	void ClientLog(std::string msg);
+	std::string sPort;
+	int iPort;
 
 private:
 
 	std::string configName = "config.txt";
-	std::string sPort;
-	int iPort;
 
 	struct WindowData
 	{
@@ -2904,9 +2904,55 @@ int MainWindow::ReceiveThread()
 		 return true;
 	 }
 
+	 // Helper for command line parsing
+	 std::string GetCmdOption(const std::vector<std::string>& args, const std::string& option) {
+		 auto it = std::find(args.begin(), args.end(), option);
+		 if (it != args.end() && ++it != args.end())
+			 return *it;
+		 return "";
+	 }
+	 bool CmdOptionExists(const std::vector<std::string>& args, const std::string& option) {
+		 return std::find(args.begin(), args.end(), option) != args.end();
+	 }
 
+	 void PrintUsage(const char* exeName) {
+		 std::cout << "Usage:\n";
+		 std::cout << "  " << exeName << " --server [--port PORT]\n";
+		 std::cout << "  " << exeName << " --client --ip IP_ADDRESS --port PORT\n";
+		 std::cout << "Examples:\n";
+		 std::cout << "  " << exeName << " --server\n";
+		 std::cout << "  " << exeName << " --server --port 5555\n";
+		 std::cout << "  " << exeName << " --client --ip 127.0.0.1 --port 27015\n";
+	 }
 
-	 int main()
+	 // Minimal server loop for screen streaming
+	 void RunHeadlessServer(int port) {
+		 std::cout << "Starting headless server on port " << port << std::endl;
+		 SOCKET sktListen = INVALID_SOCKET;
+		 if (InitializeServer(sktListen, port) != 0) {
+			 std::cerr << "Failed to initialize server!" << std::endl;
+			 return;
+		 }
+		 std::cout << "Server listening for input connections on port " << port << std::endl;
+		 // Accept and discard input connections in a loop (you may want to expand this)
+		 while (true) {
+			 if (listen(sktListen, 1) == SOCKET_ERROR) break;
+			 sockaddr_in client_addr;
+			 int addrlen = sizeof(client_addr);
+			 SOCKET sktClient = accept(sktListen, (sockaddr*)&client_addr, &addrlen);
+			 if (sktClient == INVALID_SOCKET) continue;
+			 std::thread(ScreenStreamServerThread, sktClient).detach();
+		 }
+		 closesocket(sktListen);
+	 }
+
+	 // Minimal client launcher to receive the screen (no UI)
+	 void RunHeadlessClient(const std::string& ip, int port) {
+		 std::cout << "Starting headless client, connecting to " << ip << ":" << port << std::endl;
+		 StartScreenRecv(ip, port);
+	 }
+
+	 int main(int argc, char* argv[])
 	 {
 		 // ---- Ensure WSAStartup is called ONCE here ----
 		 WSADATA wsadata;
@@ -2915,6 +2961,12 @@ int MainWindow::ReceiveThread()
 			 std::cout << "WSAStartup failed: " << wsaResult << std::endl;
 			 return 1;
 		 }
+
+		 // --- Command line mode check ---
+		 std::vector<std::string> args(argv + 1, argv + argc);
+		 bool isServer = CmdOptionExists(args, "--server");
+		 bool isClient = CmdOptionExists(args, "--client");
+
 		 MainWindow win;
 		 g_pMainWindow = &win; // <-- Set the global pointer after win is defined
 
@@ -2931,6 +2983,64 @@ int MainWindow::ReceiveThread()
 		 // Set Always On Top on restore
 		 if (win.m_savedAlwaysOnTop) {
 			 SetWindowPos(win.Window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+		 }
+
+		 // --- Command-line reflection logic for GUI ---
+		 if (!args.empty()) {
+			 if ((isServer && isClient) || (!isServer && !isClient)) {
+				 PrintUsage(argv[0]);
+				 WSACleanup();
+				 return 1;
+			 }
+
+			 if (isServer) {
+				 int port = DEFAULT_PORT;
+				 std::string portStr = GetCmdOption(args, "--port");
+				 if (!portStr.empty()) {
+					 try { port = std::stoi(portStr); }
+					 catch (...) {
+						 std::cerr << "Invalid port: " << portStr << std::endl;
+						 WSACleanup();
+						 return 1;
+					 }
+				 }
+				 win.sPort = std::to_string(port); // sPort should be made public
+				 SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
+				 win.SetMode(MainWindow::MODE::SERVER);
+
+				 // Ensure radio buttons reflect the mode
+				 SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_CHECKED, 0);
+				 SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
+
+				 PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_START, BN_CLICKED), 0);
+			 }
+			 else if (isClient) {
+				 std::string ip = GetCmdOption(args, "--ip");
+				 std::string portStr = GetCmdOption(args, "--port");
+				 int port = DEFAULT_PORT;
+				 if (ip.empty() || portStr.empty()) {
+					 PrintUsage(argv[0]);
+					 WSACleanup();
+					 return 1;
+				 }
+				 try { port = std::stoi(portStr); }
+				 catch (...) {
+					 std::cerr << "Invalid port: " << portStr << std::endl;
+					 WSACleanup();
+					 return 1;
+				 }
+				 win.Client.ip = ip;
+				 SetWindowTextA(win.m_itxtIP.Window(), ip.c_str());
+				 win.sPort = std::to_string(port); // sPort should be made public
+				 SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
+				 win.SetMode(MainWindow::MODE::CLIENT);
+
+				 // Ensure radio buttons reflect the mode
+				 SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_CHECKED, 0);
+				 SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
+
+				 PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_CONNECT, BN_CLICKED), 0);
+			 }
 		 }
 
 		 ShowWindow(win.Window(), 1);
