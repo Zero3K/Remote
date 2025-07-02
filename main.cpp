@@ -612,8 +612,12 @@ int CloseConnection(SOCKET* sktConn) {
 // --- Server streaming: send tiles using BasicBitmap for all buffer ops ---
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
-	BasicBitmap* prevBmp = nullptr;
+
+	// Use unique_ptr since BasicBitmap has no default constructor
+	std::unique_ptr<BasicBitmap> prevBmp;
+	std::unique_ptr<BasicBitmap> currBmp;
 	std::vector<uint32_t> prev_pixels;
+	std::vector<uint32_t> curr_pixels;
 	bool first = true;
 	static int frameCounter = 0;
 
@@ -630,12 +634,18 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		int frameInterval = 1000 / fps;
 		auto start = steady_clock::now();
 
-		BasicBitmap* currBmp = nullptr;
-		if (!CaptureScreenToBasicBitmap(currBmp)) continue;
-		int width = currBmp->Width(), height = currBmp->Height();
+		// --- Capture into a new BasicBitmap ---
+		BasicBitmap* pBmp = nullptr;
+		if (!CaptureScreenToBasicBitmap(pBmp)) continue;
+		currBmp.reset(pBmp); // take ownership
+
+		if (!currBmp) continue; // safety check
+
+		int width = currBmp->Width();
+		int height = currBmp->Height();
 		const uint8_t* curr_rgba = currBmp->Bits();
 
-		std::vector<uint32_t> curr_pixels(width * height);
+		curr_pixels.resize(width * height);
 		memcpy(curr_pixels.data(), curr_rgba, width * height * 4);
 
 		std::vector<DirtyTile> DirtyTiles;
@@ -643,19 +653,23 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		if (first || frameCounter % 60 == 0) {
 			DirtyTiles.clear();
 			DirtyTiles.push_back({ 0, 0, width, height });
-			if (prevBmp) delete prevBmp;
-			prevBmp = new BasicBitmap(*currBmp);
+			prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 			prev_pixels = curr_pixels;
 			first = false;
 		}
 		else {
-			detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), width, height, DirtyTiles);
+			if (prevBmp && prev_pixels.size() == curr_pixels.size()) {
+				detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), width, height, DirtyTiles);
+			}
+			else {
+				DirtyTiles.clear();
+				DirtyTiles.push_back({ 0, 0, width, height });
+			}
 			size_t totalTiles = ((width + TILE_W - 1) / TILE_W) * ((height + TILE_H - 1) / TILE_H);
 			if (DirtyTiles.size() > totalTiles * 0.3) {
 				DirtyTiles.clear();
 				DirtyTiles.push_back({ 0, 0, width, height });
-				if (prevBmp) delete prevBmp;
-				prevBmp = new BasicBitmap(*currBmp);
+				prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 				prev_pixels = curr_pixels;
 			}
 		}
@@ -666,16 +680,22 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		if (ret != sizeof(nTilesNet)) break;
 
 		for (const auto& r : DirtyTiles) {
-			BasicBitmap* tile = extract_tile_basicbitmap(curr_rgba, width, height, r);
+			int rw = r.right - r.left, rh = r.bottom - r.top;
+			BasicBitmap tile(rw, rh, BasicBitmap::A8R8G8B8);
+			for (int row = 0; row < rh; ++row) {
+				const uint8_t* src = curr_rgba + ((r.top + row) * width + r.left) * 4;
+				uint8_t* dst = tile.Bits() + row * rw * 4;
+				memcpy(dst, src, rw * 4);
+			}
 			std::vector<uint8_t> qoiData;
-			QOIEncodeBasicBitmap(tile, qoiData);
+			QOIEncodeBasicBitmap(&tile, qoiData);
 
-			uint32_t rw = tile->Width(), rh = tile->Height();
 			uint32_t xNet = htonl(r.left);
 			uint32_t yNet = htonl(r.top);
 			uint32_t wNet = htonl(rw);
 			uint32_t hNet = htonl(rh);
 			uint32_t qoiLenNet = htonl((uint32_t)qoiData.size());
+
 			send(sktClient, (const char*)&xNet, 4, 0);
 			send(sktClient, (const char*)&yNet, 4, 0);
 			send(sktClient, (const char*)&wNet, 4, 0);
@@ -689,12 +709,9 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 				offset += sent;
 			}
 			bytes += qoiData.size() + 20;
-			delete tile;
 		}
-		if (prevBmp) delete prevBmp;
-		prevBmp = new BasicBitmap(*currBmp);
+		prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 		prev_pixels = curr_pixels;
-		delete currBmp;
 
 		frames++;
 		g_screenStreamW = width;
@@ -717,6 +734,7 @@ END:
 
 
 
+
 // Store a pointer to this struct in the window's GWLP_USERDATA
 // You must set this on window creation.
 
@@ -726,11 +744,16 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	size_t bytesLastSec = 0;
 	int framesLastSec = 0;
 	auto lastSec = steady_clock::now();
+
 	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 	if (!bmpState) {
 		closesocket(skt);
 		return;
 	}
+
+	std::vector<RECT> invalidateRects;
+	std::vector<uint8_t> qoiData; // reused for each tile
+
 	bool running = true;
 	while (running) {
 		uint32_t nTilesNet = 0;
@@ -740,7 +763,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 		if (nTiles == 0) continue;
 		size_t bytesThisFrame = 4;
 		bool frame_error = false, fullScreenInvalidation = false;
-		std::vector<RECT> invalidateRects;
+		invalidateRects.clear();
+
 		for (uint32_t i = 0; i < nTiles; ++i) {
 			uint32_t x, y, w, h, qoiLen;
 			int got;
@@ -751,7 +775,9 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			got = recv(skt, (char*)&qoiLen, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			bytesThisFrame += 4 * 5;
 			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
-			std::vector<uint8_t> qoiData(qoiLen);
+
+			// --- Reuse qoiData buffer ---
+			qoiData.resize(qoiLen);
 			size_t offset = 0;
 			while (offset < qoiLen) {
 				got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
@@ -760,8 +786,16 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				bytesThisFrame += got;
 			}
 			if (!running) break;
-			BasicBitmap* tileBmp = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
-			if (!tileBmp) continue;
+
+			// --- Use unique_ptr for tileBmp, correct object management ---
+			std::unique_ptr<BasicBitmap> tileBmp;
+			{
+				BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
+				if (!decoded) continue;
+				tileBmp.reset(decoded);
+			}
+
+			// --- Patch tile into window's BasicBitmap framebuffer ---
 			EnterCriticalSection(&bmpState->cs);
 			int needW = std::max(bmpState->imgW, (int)(x + w));
 			int needH = std::max(bmpState->imgH, (int)(y + h));
@@ -790,8 +824,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				invalidateRects.push_back(tileRect);
 			}
 			LeaveCriticalSection(&bmpState->cs);
-			delete tileBmp;
 		}
+
 		if (fullScreenInvalidation) {
 			InvalidateRect(hwnd, NULL, FALSE);
 		}
@@ -820,7 +854,6 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 		}
 	}
 }
-
 
 
 
