@@ -15,6 +15,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <locale>
+#include <codecvt>
 
 #define NOMINMAX
 #include <Windows.h>
@@ -32,6 +34,95 @@
 #include <set> // DIRTY TILE
 #include <algorithm> // DIRTY TILE
 #pragma comment(lib, "Ws2_32.lib")
+
+// === CLIPBOARD PROTOCOL ===
+enum class MsgType : uint8_t {
+	Input = 0,
+	RemoteCtrl = 1,
+	Clipboard = 2 // new
+};
+
+#pragma pack(push, 1)
+struct ClipboardMsg {
+	MsgType type; // Must be Clipboard
+	uint32_t length; // length of the following UTF-8 string
+	// char data[]; // immediately following, not part of struct
+};
+#pragma pack(pop)
+
+
+// === CLIPBOARD UTILITIES ===
+static HWND g_clipboardNext = nullptr;
+static SOCKET g_clipboardSocket = INVALID_SOCKET; // set to connected socket on client/server
+
+void SendClipboardPacket(SOCKET sock, const std::string& utf8) {
+	ClipboardMsg msg;
+	msg.type = MsgType::Clipboard;
+	msg.length = static_cast<uint32_t>(utf8.size());
+	send(sock, (const char*)&msg, sizeof(msg), 0);
+	if (!utf8.empty())
+		send(sock, utf8.data(), (int)utf8.size(), 0);
+}
+
+// Send local clipboard to peer
+void SendLocalClipboard(SOCKET sock) {
+	if (!OpenClipboard(nullptr)) return;
+	HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+	if (hData) {
+		wchar_t* wstr = (wchar_t*)GlobalLock(hData);
+		if (wstr) {
+			std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+			std::string utf8 = conv.to_bytes(wstr);
+			SendClipboardPacket(sock, utf8);
+			GlobalUnlock(hData);
+		}
+	}
+	CloseClipboard();
+}
+
+// Set local clipboard from received string
+void ApplyRemoteClipboard(const std::string& utf8) {
+	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> conv;
+	std::wstring wtext = conv.from_bytes(utf8);
+	if (OpenClipboard(nullptr)) {
+		EmptyClipboard();
+		HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, (wtext.size() + 1) * sizeof(wchar_t));
+		if (hGlob) {
+			memcpy(GlobalLock(hGlob), wtext.c_str(), (wtext.size() + 1) * sizeof(wchar_t));
+			GlobalUnlock(hGlob);
+			SetClipboardData(CF_UNICODETEXT, hGlob);
+		}
+		CloseClipboard();
+	}
+}
+
+// Clipboard chain window proc (call in your window proc)
+LRESULT HandleClipboardMsg(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	switch (msg) {
+	case WM_DRAWCLIPBOARD:
+		if (g_clipboardSocket != INVALID_SOCKET) SendLocalClipboard(g_clipboardSocket);
+		if (g_clipboardNext) SendMessage(g_clipboardNext, msg, wParam, lParam);
+		return 0;
+	case WM_CHANGECBCHAIN:
+		if ((HWND)wParam == g_clipboardNext)
+			g_clipboardNext = (HWND)lParam;
+		else if (g_clipboardNext)
+			SendMessage(g_clipboardNext, msg, wParam, lParam);
+		return 0;
+	}
+	return 0;
+}
+
+// Init clipboard monitoring (call after window creation)
+void InitClipboardMonitor(HWND hwnd, SOCKET sock) {
+	g_clipboardSocket = sock;
+	g_clipboardNext = SetClipboardViewer(hwnd);
+}
+void CleanupClipboardMonitor(HWND hwnd) {
+	ChangeClipboardChain(hwnd, g_clipboardNext);
+	g_clipboardNext = nullptr;
+	g_clipboardSocket = INVALID_SOCKET;
+}
 
 enum class RemoteCtrlType : uint8_t {
 	SetQuality = 1,
@@ -633,6 +724,20 @@ int CloseConnection(SOCKET* sktConn) {
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 
+	// --- Clipboard protocol structures (should match recv side) ---
+	enum class MsgType : uint8_t {
+		Input = 0,
+		RemoteCtrl = 1,
+		Clipboard = 2
+	};
+#pragma pack(push, 1)
+	struct ClipboardMsg {
+		MsgType type;
+		uint32_t length;
+		// char data[] follows
+	};
+#pragma pack(pop)
+
 	std::unique_ptr<BasicBitmap> prevBmp;
 	std::unique_ptr<BasicBitmap> currBmp;
 	bool first = true;
@@ -662,7 +767,44 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	send(sktClient, (const char*)&heightNet, 4, 0);
 	SSDPRINTF("ScreenStreamServerThread: sent initial screen size %dx%d\n", screen_width, screen_height);
 
+	// --- Clipboard: allow receiving clipboard packets from client and apply locally ---
+	// You may want a non-blocking socket or select() for production, here we check at each frame
+	auto try_receive_clipboard = [&]() {
+		u_long nonblock = 1;
+		ioctlsocket(sktClient, FIONBIO, &nonblock);
+		char cbuf[8192];
+		int peeked = recv(sktClient, cbuf, sizeof(ClipboardMsg), MSG_PEEK);
+		if (peeked >= (int)sizeof(ClipboardMsg)) {
+			ClipboardMsg* cmsg = (ClipboardMsg*)cbuf;
+			if (cmsg->type == MsgType::Clipboard && peeked >= int(sizeof(ClipboardMsg) + cmsg->length)) {
+				// Now receive the full message
+				int to_recv = sizeof(ClipboardMsg) + cmsg->length;
+				int recvd = 0;
+				std::vector<char> msgbuf(to_recv);
+				while (recvd < to_recv) {
+					int g = recv(sktClient, msgbuf.data() + recvd, to_recv - recvd, 0);
+					if (g <= 0) break;
+					recvd += g;
+				}
+				if (recvd == to_recv) {
+					std::string utf8(msgbuf.data() + sizeof(ClipboardMsg), cmsg->length);
+					ApplyRemoteClipboard(utf8);
+				}
+				// Processed clipboard, return true
+				u_long block = 0;
+				ioctlsocket(sktClient, FIONBIO, &block);
+				return true;
+			}
+		}
+		u_long block = 0;
+		ioctlsocket(sktClient, FIONBIO, &block);
+		return false;
+	};
+
 	while (g_screenStreamActive) {
+		// Check for clipboard data from client
+		try_receive_clipboard();
+
 		int fps = g_streamingFps.load();
 		int frameInterval = 1000 / fps;
 		auto start = steady_clock::now();
@@ -892,8 +1034,21 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 	std::string last_ip = ip;
 	int last_port = server_port;
 
+	// --- Clipboard protocol structures (must match those used elsewhere) ---
+	enum class MsgType : uint8_t {
+		Input = 0,
+		RemoteCtrl = 1,
+		Clipboard = 2
+	};
+#pragma pack(push, 1)
+	struct ClipboardMsg {
+		MsgType type;
+		uint32_t length; // length of the following UTF-8 string
+		// char data[] follows
+	};
+#pragma pack(pop)
+
 	while (true) {
-		// If user closed window, exit immediately
 		if (!WindowStillOpen(hwnd)) {
 			SRDPRINTF("ScreenRecvThread: User closed window, exiting.\n");
 			if (skt != INVALID_SOCKET) closesocket(skt);
@@ -930,13 +1085,11 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				continue;
 			}
 			SRDPRINTF("ScreenRecvThread: Connected!\n");
-			// Fetch the real remote connection info
 			std::tie(last_ip, last_port) = GetPeerIpAndPort(skt);
 		}
 
 		SetConnectionTitle(hwnd, last_ip, last_port, "Connected");
 
-		// -- Check for user close before starting streaming --
 		if (!WindowStillOpen(hwnd)) {
 			closesocket(skt);
 			return;
@@ -987,11 +1140,43 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 
 		// --- Streaming loop ---
 		while (running) {
+			// --- Clipboard receive branch ---
+			{
+				// Use non-blocking peek or select to check for clipboard packet (or interleave with dirty tile receive as needed)
+				u_long nonblock = 1;
+				ioctlsocket(skt, FIONBIO, &nonblock);
+				char cbuf[8192];
+				int peeked = recv(skt, cbuf, sizeof(ClipboardMsg), MSG_PEEK);
+				if (peeked >= (int)sizeof(ClipboardMsg)) {
+					ClipboardMsg* cmsg = (ClipboardMsg*)cbuf;
+					if (cmsg->type == MsgType::Clipboard && peeked >= int(sizeof(ClipboardMsg) + cmsg->length)) {
+						// Now receive the full message
+						int to_recv = sizeof(ClipboardMsg) + cmsg->length;
+						int recvd = 0;
+						std::vector<char> msgbuf(to_recv);
+						while (recvd < to_recv) {
+							int g = recv(skt, msgbuf.data() + recvd, to_recv - recvd, 0);
+							if (g <= 0) break;
+							recvd += g;
+						}
+						if (recvd == to_recv) {
+							std::string utf8(msgbuf.data() + sizeof(ClipboardMsg), cmsg->length);
+							ApplyRemoteClipboard(utf8);
+						}
+						continue;
+					}
+				}
+				u_long block = 0;
+				ioctlsocket(skt, FIONBIO, &block);
+			}
+			// --- End Clipboard receive branch ---
+
 			if (!WindowStillOpen(hwnd)) {
 				closesocket(skt);
 				return;
 			}
 
+			// ... the rest of your original streaming loop is unchanged ...
 			uint32_t xrleBitmaskLenNet = 0;
 			int ret = recv(skt, (char*)&xrleBitmaskLenNet, 4, MSG_WAITALL);
 			if (ret != 4) {
@@ -1889,8 +2074,14 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		return HandleCommand(uMsg, wParam, lParam);
 	case WM_CLOSE:
 		return HandleClose(uMsg, wParam, lParam);
+		// --- Clipboard sync messages ---
+	case WM_DRAWCLIPBOARD:
+	case WM_CHANGECBCHAIN:
+		// Call clipboard handler (ensure it's implemented as shown in previous message)
+		return HandleClipboardMsg(m_hwnd, uMsg, wParam, lParam);
 		// WM_EXITSIZEMOVE handling for MainWindow removed! It should be handled in the remote screen window proc instead.
 	case WM_DESTROY:
+		CleanupClipboardMonitor(m_hwnd); // cleanup clipboard chain on destroy
 		PostQuitMessage(0);
 		return 0;
 	default:
@@ -3029,6 +3220,10 @@ int MainWindow::ReceiveThread()
 			 SetWindowPos(win.Window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 		 }
 
+		 // --- Clipboard sync: initialize clipboard monitoring as soon as window is created ---
+		 // By default, don't set socket yet (set it after connect in client/server logic).
+		 InitClipboardMonitor(win.Window(), INVALID_SOCKET);
+
 		 // --- Command-line reflection logic for GUI ---
 		 if (!args.empty()) {
 			 if ((isServer && isClient) || (!isServer && !isClient)) {
@@ -3103,6 +3298,9 @@ int MainWindow::ReceiveThread()
 			 TranslateMessage(&msg);
 			 DispatchMessage(&msg);
 		 }
+
+		 CleanupClipboardMonitor(win.Window());
+
 		 WSACleanup();
 		 return 0;
 	 }
