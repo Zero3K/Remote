@@ -52,6 +52,8 @@ struct DirtyTile {
 constexpr int TILE_W = 32;
 constexpr int TILE_H = 32;
 
+class BasicBitmap;
+class MainWindow;
 
 // --- Per-window state using BasicBitmap for framebuffer (no hBitmap or dibBits needed) ---
 // State for each streamed window
@@ -61,6 +63,9 @@ struct ScreenBitmapState {
 	int imgH = 0;
 	CRITICAL_SECTION cs;
 	SOCKET* psktInput = nullptr;
+	MainWindow* mainWindow = nullptr;
+
+
 	ScreenBitmapState() { InitializeCriticalSection(&cs); }
 	~ScreenBitmapState() { if (bmp) delete bmp; DeleteCriticalSection(&cs); }
 };
@@ -1330,8 +1335,16 @@ class MainWindow : public BaseWindow
 public:
 	int m_savedFps = SCREEN_STREAM_FPS;
 	bool m_savedAlwaysOnTop = false;
+	int m_savedWinLeft = 100;
+	int m_savedWinTop = 100;
 	int m_savedWinW = 477;
 	int m_savedWinH = 340;
+	int m_savedRemoteLeft = 100;
+	int m_savedRemoteTop = 100;
+	int m_savedRemoteW = 900;    // Default matches your CreateWindowA
+	int m_savedRemoteH = 600;
+	HWND RemoteScreenWnd = nullptr;
+
 
 public:
 	MainWindow();
@@ -1531,6 +1544,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	switch (msg) {
 	case WM_CREATE:
 		bmpState = new ScreenBitmapState();
+		bmpState->mainWindow = g_pMainWindow;
 		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)bmpState);
 		break;
 
@@ -1539,15 +1553,10 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			bmpState->psktInput = (SOCKET*)lParam;
 		return 0;
 
-	case WM_USER + 1:   // New bitmap and size from thread
-		// No longer handled: thread never allocates a new ScreenBitmapState, only updates its members
-		return 0;
-
 	case WM_USER + 2:
 		SetWindowTextA(hwnd, (const char*)lParam);
 		break;
 
-		// --- Context menu handling (unchanged, but uses hwnd) ---
 	case WM_CONTEXTMENU: {
 		POINT pt;
 		pt.x = LOWORD(lParam);
@@ -1567,19 +1576,16 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
-			// Video Quality
 		case IDM_VIDEO_QUALITY_1: SetRemoteScreenQuality(hwnd, 1); break;
 		case IDM_VIDEO_QUALITY_2: SetRemoteScreenQuality(hwnd, 2); break;
 		case IDM_VIDEO_QUALITY_3: SetRemoteScreenQuality(hwnd, 3); break;
 		case IDM_VIDEO_QUALITY_4: SetRemoteScreenQuality(hwnd, 4); break;
-			// Video FPS
 		case IDM_VIDEO_FPS_5: SetRemoteScreenFps(hwnd, 5); break;
 		case IDM_VIDEO_FPS_10: SetRemoteScreenFps(hwnd, 10); break;
 		case IDM_VIDEO_FPS_20: SetRemoteScreenFps(hwnd, 20); break;
 		case IDM_VIDEO_FPS_30: SetRemoteScreenFps(hwnd, 30); break;
 		case IDM_VIDEO_FPS_40: SetRemoteScreenFps(hwnd, 40); break;
 		case IDM_VIDEO_FPS_60: SetRemoteScreenFps(hwnd, 60); break;
-			// Always On Top
 		case IDM_ALWAYS_ON_TOP:
 			g_alwaysOnTop = !g_alwaysOnTop;
 			if (g_pMainWindow) {
@@ -1588,7 +1594,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			}
 			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
 			break;
-			// Send Keys
 		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
 		case IDM_SENDKEYS_CTRLESC:  SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRLESC); break;
 		case IDM_SENDKEYS_CTRALTDEL:SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRALTDEL); break;
@@ -1596,15 +1601,13 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		break;
 
-		// --- Input handling uses bmpState->psktInput ---
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONUP:
 	case WM_RBUTTONDOWN:
 	case WM_RBUTTONUP:
 	case WM_MBUTTONDOWN:
 	case WM_MBUTTONUP:
-	case WM_MOUSEMOVE:
-	{
+	case WM_MOUSEMOVE: {
 		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
 			INPUT input = {};
 			input.type = INPUT_MOUSE;
@@ -1636,8 +1639,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		break;
 	}
-	case WM_MOUSEWHEEL:
-	{
+	case WM_MOUSEWHEEL: {
 		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
 			INPUT input = {};
 			input.type = INPUT_MOUSE;
@@ -1648,8 +1650,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		break;
 	}
 	case WM_KEYDOWN:
-	case WM_KEYUP:
-	{
+	case WM_KEYUP: {
 		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
 			INPUT input = {};
 			input.type = INPUT_KEYBOARD;
@@ -1664,7 +1665,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	case WM_ERASEBKGND:
 		return 1; // Prevent flicker
 
-// --- In WM_PAINT: blit BasicBitmap to window (using DIBSection for output) ---
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
@@ -1710,7 +1710,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		FillRect(hdcBuf, &clientRect, brush);
 		DeleteObject(brush);
 
-		ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+		// Use the bmpState retrieved at the top!
 		if (bmpState && bmpState->bmp) {
 			EnterCriticalSection(&bmpState->cs);
 			int srcW = bmpState->bmp->Width();
@@ -1731,7 +1731,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				offsetY = (destH - drawH) / 2;
 			}
 
-			// 1. Allocate a temp DIBSection for the BasicBitmap image, if needed.
 			BITMAPINFO bmi = { 0 };
 			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 			bmi.bmiHeader.biWidth = srcW;
@@ -1742,7 +1741,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			void* pBits = nullptr;
 			HBITMAP hBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
 
-			// 2. Copy RGBA from BasicBitmap to BGRA for the DIBSection.
+			// RGBA to BGRA
 			uint8_t* src = bmpState->bmp->Bits();
 			uint8_t* dst = (uint8_t*)pBits;
 			for (int i = 0; i < srcW * srcH; ++i) {
@@ -1752,7 +1751,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				dst[i * 4 + 3] = 255;            // A
 			}
 
-			// 3. Draw/scaledraw the temp DIBSection to the double buffer.
 			HDC hMem = CreateCompatibleDC(hdcBuf);
 			HGDIOBJ oldObj = SelectObject(hMem, hBmp);
 			SetStretchBltMode(hdcBuf, COLORONCOLOR);
@@ -1768,7 +1766,20 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		EndPaint(hwnd, &ps);
 		break;
 	}
-    	case WM_DESTROY: {
+	case WM_EXITSIZEMOVE: // Save window geometry for restoring
+		if (bmpState && bmpState->mainWindow) {
+			WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+			if (GetWindowPlacement(hwnd, &wp)) {
+				RECT& r = wp.rcNormalPosition;
+				bmpState->mainWindow->m_savedRemoteLeft = r.left;
+				bmpState->mainWindow->m_savedRemoteTop = r.top;
+				bmpState->mainWindow->m_savedRemoteW = r.right - r.left;
+				bmpState->mainWindow->m_savedRemoteH = r.bottom - r.top;
+				bmpState->mainWindow->SaveConfig();
+			}
+		}
+		break;
+	case WM_DESTROY: {
 		static HBITMAP hDoubleBufBmp = NULL;
 		static void* pDoubleBufBits = NULL;
 		if (hDoubleBufBmp) {
@@ -1788,6 +1799,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	return 0;
 }
 
+// StartScreenRecv: create remote window and set up state, but do NOT touch GWLP_USERDATA here
 void StartScreenRecv(std::string server_ip, int port) {
 	// Reuse main input socket if possible
 	SOCKET* psktInput = nullptr;
@@ -1805,8 +1817,18 @@ void StartScreenRecv(std::string server_ip, int port) {
 	wc.hInstance = GetModuleHandle(NULL);
 	RegisterClassA(&wc);
 
-	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
-		CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, NULL, NULL, wc.hInstance, NULL);
+	// --- Restore placement variables from config ---
+	int left = g_pMainWindow ? g_pMainWindow->m_savedRemoteLeft : 100;
+	int top = g_pMainWindow ? g_pMainWindow->m_savedRemoteTop : 100;
+	int w = g_pMainWindow ? g_pMainWindow->m_savedRemoteW : 900;
+	int h = g_pMainWindow ? g_pMainWindow->m_savedRemoteH : 600;
+
+    HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
+		left, top, w, h, NULL, NULL, wc.hInstance, NULL);
+
+	// Save HWND to main window if you want access later
+	if (g_pMainWindow)
+		g_pMainWindow->RemoteScreenWnd = hwnd;
 
 	// Pass input socket pointer to the window
 	SendMessage(hwnd, WM_USER + 100, 0, (LPARAM)psktInput);
@@ -1837,6 +1859,7 @@ void StartScreenRecv(std::string server_ip, int port) {
 		closesocket(skt);
 	}
 }
+
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
@@ -1856,7 +1879,6 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 			INPUT inputBuff;
 			ConvertInput((PRAWINPUT)lpb, &inputBuff);
 			delete[] lpb;
-
 			// Send to server
 			send(Client.sktServer, (char*)&inputBuff, sizeof(INPUT), 0);
 		}
@@ -1867,15 +1889,7 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		return HandleCommand(uMsg, wParam, lParam);
 	case WM_CLOSE:
 		return HandleClose(uMsg, wParam, lParam);
-	case WM_SIZE:
-	{
-		RECT r;
-		if (m_hwnd && GetWindowRect(m_hwnd, &r)) {
-			m_savedWinW = r.right - r.left;
-			m_savedWinH = r.bottom - r.top;
-			SaveConfig();
-			break;
-		}
+		// WM_EXITSIZEMOVE handling for MainWindow removed! It should be handled in the remote screen window proc instead.
 	case WM_DESTROY:
 		PostQuitMessage(0);
 		return 0;
@@ -1883,7 +1897,6 @@ LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 		return DefWindowProc(m_hwnd, uMsg, wParam, lParam);
 	}
 	return TRUE;
-	}
 }
 
 // Removed RetrieveInput logic (no longer used on server)
@@ -2600,6 +2613,7 @@ int MainWindow::ServerTerminate()
 		g_screenStreamActive = false;
 		return 0;
 	}
+	SaveConfig();
 	return 1;
 }
 
@@ -2660,6 +2674,7 @@ int MainWindow::ClientDisconnect()
 	Button_Enable(m_btnModeServer.Window(), true);
 	Button_Enable(m_btnModeClient.Window(), true);
 
+	SaveConfig();
 	return 0;
 }
 
@@ -2819,16 +2834,23 @@ int MainWindow::ReceiveThread()
 		 f << "max_clients " << Server.maxClients << std::endl;
 		 f << "fps " << g_streamingFps.load() << std::endl;
 		 f << "always_on_top " << (g_alwaysOnTop ? 1 : 0) << std::endl;
-		 RECT r;
-		 if (m_hwnd && GetWindowRect(m_hwnd, &r)) {
-			 f << "window_size " << (r.right - r.left) << " " << (r.bottom - r.top) << std::endl;
+		 f << "remote_rect " << m_savedRemoteLeft << " " << m_savedRemoteTop << " "
+		   << m_savedRemoteW << " " << m_savedRemoteH << "\n";
+
+		 WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+		 if (m_hwnd && GetWindowPlacement(m_hwnd, &wp) && wp.showCmd == SW_SHOWNORMAL) {
+			 RECT& r = wp.rcNormalPosition;
+			 f << "window_rect " << r.left << " " << r.top << " "
+				 << (r.right - r.left) << " " << (r.bottom - r.top) << std::endl;
 		 }
 		 else {
-			 f << "window_size " << m_savedWinW << " " << m_savedWinH << std::endl;
+			 // fallback to last saved
+			 f << "window_rect " << m_savedWinLeft << " " << m_savedWinTop << " " << m_savedWinW << " " << m_savedWinH << std::endl;
 		 }
 		 f.close();
 		 return true;
 	 }
+
 
 	 // --- LoadConfig: now loads FPS, AlwaysOnTop, and window size ---
 	 bool MainWindow::LoadConfig()
@@ -2838,8 +2860,15 @@ int MainWindow::ReceiveThread()
 		 Server.maxClients = MAX_CLIENTS;
 		 m_savedFps = SCREEN_STREAM_FPS;
 		 m_savedAlwaysOnTop = false;
+		 m_savedWinLeft = 100;
+		 m_savedWinTop = 100;
 		 m_savedWinW = 477;
 		 m_savedWinH = 340;
+		 m_savedRemoteLeft = 100;
+		 m_savedRemoteTop = 100;
+		 m_savedRemoteW = 900;
+		 m_savedRemoteH = 600;
+
 		 std::fstream f(configName, std::fstream::in);
 		 if (!f.is_open())
 		 {
@@ -2882,12 +2911,24 @@ int MainWindow::ReceiveThread()
 				 m_savedAlwaysOnTop = (atop != 0);
 				 g_alwaysOnTop = m_savedAlwaysOnTop;
 			 }
-			 else if (param == "window_size") {
-				 int w = 477, h = 340;
-				 s >> w >> h;
+			 else if (param == "window_rect") {
+				 int l, t, w, h;
+				 s >> l >> t >> w >> h;
 				 if (w > 100 && h > 100) {
+					 m_savedWinLeft = l;
+					 m_savedWinTop = t;
 					 m_savedWinW = w;
 					 m_savedWinH = h;
+				 }
+			 }
+			 else if (param == "remote_rect") {
+				 int l, t, w, h;
+				 s >> l >> t >> w >> h;
+				 if (w > 100 && h > 100) {
+					 m_savedRemoteLeft = l;
+					 m_savedRemoteTop = t;
+					 m_savedRemoteW = w;
+					 m_savedRemoteH = h;
 				 }
 			 }
 		 }
@@ -2898,7 +2939,10 @@ int MainWindow::ReceiveThread()
 			 << "    max number clients = " << Server.maxClients << std::endl
 			 << "    fps = " << m_savedFps << std::endl
 			 << "    always_on_top = " << (m_savedAlwaysOnTop ? "true" : "false") << std::endl
-			 << "    window size = " << m_savedWinW << "x" << m_savedWinH << std::endl;
+			 << "    window rect = (" << m_savedWinLeft << "," << m_savedWinTop << ") "
+			 << m_savedWinW << "x" << m_savedWinH << std::endl
+			 << "    remote rect = (" << m_savedRemoteLeft << "," << m_savedRemoteTop << ") "
+			 << m_savedRemoteW << "x" << m_savedRemoteH << std::endl;
 
 		 f.close();
 		 return true;
@@ -3042,6 +3086,14 @@ int MainWindow::ReceiveThread()
 				 PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_CONNECT, BN_CLICKED), 0);
 			 }
 		 }
+		 // Use loaded position and size from config
+		 WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+		 wp.showCmd = SW_SHOWNORMAL;
+		 wp.rcNormalPosition.left = win.m_savedWinLeft;
+		 wp.rcNormalPosition.top = win.m_savedWinTop;
+		 wp.rcNormalPosition.right = win.m_savedWinLeft + win.m_savedWinW;
+		 wp.rcNormalPosition.bottom = win.m_savedWinTop + win.m_savedWinH;
+		 SetWindowPlacement(win.Window(), &wp);
 
 		 ShowWindow(win.Window(), 1);
 
