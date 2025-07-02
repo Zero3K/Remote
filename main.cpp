@@ -22,6 +22,7 @@
 
 #include <objidl.h>
 #include "qoi.h"
+#include "BasicBitmap.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -50,26 +51,18 @@ constexpr int TILE_W = 32;
 constexpr int TILE_H = 32;
 
 
-// Define per-window state struct (can be in a header)
+// --- Per-window state using BasicBitmap for framebuffer (no hBitmap or dibBits needed) ---
+// State for each streamed window
 struct ScreenBitmapState {
-	HBITMAP hBitmap = NULL;
-	void* dibBits = nullptr;
+	BasicBitmap* bmp = nullptr;
 	int imgW = 0;
 	int imgH = 0;
-	std::vector<uint8_t> framebuffer;
-	CRITICAL_SECTION cs; // Add a critical section for thread safety
-	SOCKET* psktInput = nullptr; // pointer to input socket
-
+	CRITICAL_SECTION cs;
+	SOCKET* psktInput = nullptr;
 	ScreenBitmapState() { InitializeCriticalSection(&cs); }
-	~ScreenBitmapState() {
-		if (hBitmap) {
-			DeleteObject(hBitmap);
-			hBitmap = NULL;
-			dibBits = nullptr;
-		}
-		DeleteCriticalSection(&cs);
-	}
-};/**
+	~ScreenBitmapState() { if (bmp) delete bmp; DeleteCriticalSection(&cs); }
+};
+
 /**
  * Compare two 32bpp RGBA framebuffers and collect dirty tiles.
  * A simple line-by-line approach: every run of changed pixels on a scanline is a tile.
@@ -102,28 +95,38 @@ void detect_dirty_tiles(
 	}
 }
 
-// --- QOI utility for extracting subimages ---
-void extract_subimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& out_rgba) {
+// Extract a tile from a source RGBA buffer into a new BasicBitmap
+BasicBitmap* extract_tile_basicbitmap(const uint8_t* rgba, int width, int height, const DirtyTile& r) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
-	out_rgba.resize(rw * rh * 4);
+	BasicBitmap* tile = new BasicBitmap(rw, rh, BasicBitmap::A8R8G8B8);
 	for (int row = 0; row < rh; ++row) {
-		const uint8_t* src = &rgba[((r.top + row) * width + r.left) * 4];
-		uint8_t* dst = &out_rgba[(row * rw) * 4];
+		const uint8_t* src = rgba + ((r.top + row) * width + r.left) * 4;
+		uint8_t* dst = tile->Bits() + row * rw * 4;
 		memcpy(dst, src, rw * 4);
 	}
+	return tile;
 }
 
 // --- QOI encode a subimage ---
-bool QOIEncodeSubimage(const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& outQoi) {
-	std::vector<uint8_t> subimg;
-	extract_subimage(rgba, width, height, r, subimg);
+bool QOIEncodeSubimage_BasicBitmap(
+	const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& outQoi
+) {
+	int rw = r.right - r.left, rh = r.bottom - r.top;
+	BasicBitmap tile(rw, rh, BasicBitmap::A8R8G8B8);
+
+	for (int row = 0; row < rh; ++row) {
+		const uint8_t* src = &rgba[((r.top + row) * width + r.left) * 4];
+		uint8_t* dst = tile.Bits() + row * rw * 4;
+		memcpy(dst, src, rw * 4);
+	}
+
 	qoi_desc desc;
-	desc.width = r.right - r.left;
-	desc.height = r.bottom - r.top;
+	desc.width = tile.Width();
+	desc.height = tile.Height();
 	desc.channels = 4;
 	desc.colorspace = QOI_SRGB;
 	int out_len = 0;
-	void* qoi_data = qoi_encode(subimg.data(), &desc, &out_len);
+	void* qoi_data = qoi_encode(tile.Bits(), &desc, &out_len);
 	if (!qoi_data) return false;
 	outQoi.resize(out_len);
 	memcpy(outQoi.data(), qoi_data, out_len);
@@ -298,27 +301,44 @@ int nScreenHeight[2] = { 1080 , 1440 };
 
 const int nNormalized = 65535;
 
-HBITMAP CaptureScreenBitmap(int& width, int& height) {
+// --- Capture screen to BasicBitmap, with RGBA output ---
+// --- Capture screen into a BasicBitmap (RGBA) ---
+bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
+	int width = GetSystemMetrics(SM_CXSCREEN);
+	int height = GetSystemMetrics(SM_CYSCREEN);
 	HDC hScreenDC = GetDC(NULL);
-	HDC hMemDC = CreateCompatibleDC(hScreenDC);
-	width = GetSystemMetrics(SM_CXSCREEN);
-	height = GetSystemMetrics(SM_CYSCREEN);
 	BITMAPINFO bmi = { 0 };
 	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
 	bmi.bmiHeader.biWidth = width;
-	bmi.bmiHeader.biHeight = -height; // Top-down
+	bmi.bmiHeader.biHeight = -height;
 	bmi.bmiHeader.biPlanes = 1;
 	bmi.bmiHeader.biBitCount = 32;
 	bmi.bmiHeader.biCompression = BI_RGB;
-	void* pBits = NULL;
+	void* pBits = nullptr;
 	HBITMAP hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+	if (!hBitmap) { ReleaseDC(NULL, hScreenDC); return false; }
+	HDC hMemDC = CreateCompatibleDC(hScreenDC);
 	HGDIOBJ oldObj = SelectObject(hMemDC, hBitmap);
 	BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY);
 	SelectObject(hMemDC, oldObj);
 	DeleteDC(hMemDC);
 	ReleaseDC(NULL, hScreenDC);
-	return hBitmap;
+
+	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
+	uint8_t* src = static_cast<uint8_t*>(pBits);
+	uint8_t* dst = bmp->Bits();
+	for (int i = 0; i < width * height; ++i) {
+		dst[i * 4 + 0] = src[i * 4 + 2]; // R
+		dst[i * 4 + 1] = src[i * 4 + 1]; // G
+		dst[i * 4 + 2] = src[i * 4 + 0]; // B
+		dst[i * 4 + 3] = 255;
+	}
+	DeleteObject(hBitmap);
+	outBmp = bmp;
+	return true;
 }
+
+
 
 // Now, QOI expects raw RGBA data.
 // Helper to convert HBITMAP (24bpp or 32bpp) to 32bpp RGBA buffer.
@@ -353,54 +373,32 @@ bool HBITMAPToRGBA(HBITMAP hBitmap, std::vector<uint8_t>& out, int& width, int& 
 	return true;
 }
 
-// QOI encode
-bool BitmapToQOIBuffer(HBITMAP hBitmap, std::vector<uint8_t>& outBuffer, int& width, int& height) {
-	std::vector<uint8_t> rgba;
-	if (!HBITMAPToRGBA(hBitmap, rgba, width, height)) return false;
+// --- QOI encode a BasicBitmap ---
+bool QOIEncodeBasicBitmap(const BasicBitmap* bmp, std::vector<uint8_t>& outQoi) {
 	qoi_desc desc;
-	desc.width = width;
-	desc.height = height;
+	desc.width = bmp->Width();
+	desc.height = bmp->Height();
 	desc.channels = 4;
 	desc.colorspace = QOI_SRGB;
 	int out_len = 0;
-	void* qoi_data = qoi_encode(rgba.data(), &desc, &out_len);
+	void* qoi_data = qoi_encode(bmp->Bits(), &desc, &out_len);
 	if (!qoi_data) return false;
-	outBuffer.resize(out_len);
-	memcpy(outBuffer.data(), qoi_data, out_len);
+	outQoi.resize(out_len);
+	memcpy(outQoi.data(), qoi_data, out_len);
 	free(qoi_data);
 	return true;
 }
 
-// QOI decode to HBITMAP
-HBITMAP QOIBufferToBitmap(const uint8_t* data, size_t len) {
-	int w, h;
-	qoi_desc desc;
-	void* decoded = qoi_decode(data, len, &desc, 4);
-	if (!decoded) return NULL;
-	w = desc.width;
-	h = desc.height;
 
-	// Allocate a 32bpp DIB section
-	BITMAPINFO bmi = { 0 };
-	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = w;
-	bmi.bmiHeader.biHeight = -h; // top-down
-	bmi.bmiHeader.biPlanes = 1;
-	bmi.bmiHeader.biBitCount = 32;
-	bmi.bmiHeader.biCompression = BI_RGB;
-	void* bits = nullptr;
-	HBITMAP hbm = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-	// Convert RGBA to BGRA
-	uint8_t* src = (uint8_t*)decoded;
-	uint8_t* dst = (uint8_t*)bits;
-	for (int i = 0; i < w * h; ++i) {
-		dst[i * 4 + 0] = src[i * 4 + 2]; // B
-		dst[i * 4 + 1] = src[i * 4 + 1]; // G
-		dst[i * 4 + 2] = src[i * 4 + 0]; // R
-		dst[i * 4 + 3] = 255;
-	}
+// --- QOI decode to BasicBitmap ---
+BasicBitmap* QOIDecodeToBasicBitmap(const uint8_t* data, size_t len) {
+	qoi_desc desc;
+	uint8_t* decoded = (uint8_t*)qoi_decode(data, len, &desc, 4);
+	if (!decoded) return nullptr;
+	BasicBitmap* bmp = new BasicBitmap(desc.width, desc.height, BasicBitmap::A8R8G8B8);
+	memcpy(bmp->Bits(), decoded, desc.width * desc.height * 4);
 	free(decoded);
-	return hbm;
+	return bmp;
 }
 
 // SOCKETS function declarations for use in other translation units
@@ -611,85 +609,73 @@ int CloseConnection(SOCKET* sktConn) {
 
 // =================== SCREEN STREAM SERVER =====================
 
+// --- Server streaming: send tiles using BasicBitmap for all buffer ops ---
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
-	int width = 0, height = 0;
-
-	g_screenStreamActive = true;
-	g_screenStreamBytes = 0;
-	g_screenStreamFPS = 0;
-
-	std::vector<uint8_t> prev_rgba;
-	std::vector<uint8_t> curr_rgba;
+	BasicBitmap* prevBmp = nullptr;
 	std::vector<uint32_t> prev_pixels;
-	std::vector<uint32_t> curr_pixels;
-
 	bool first = true;
-	static int frameCounter = 0;  // Frame counter for periodic full frame
+	static int frameCounter = 0;
 
 	auto lastPrint = steady_clock::now();
 	int frames = 0;
 	size_t bytes = 0;
 
+	g_screenStreamActive = true;
+	g_screenStreamBytes = 0;
+	g_screenStreamFPS = 0;
+
 	while (g_screenStreamActive) {
 		int fps = g_streamingFps.load();
 		int frameInterval = 1000 / fps;
-
 		auto start = steady_clock::now();
-		HBITMAP hBitmap = CaptureScreenBitmap(width, height);
-		std::vector<uint8_t> qoiBuffer;
-		int imgW, imgH;
-		if (!HBITMAPToRGBA(hBitmap, curr_rgba, imgW, imgH)) {
-			DeleteObject(hBitmap);
-			continue;
-		}
-		DeleteObject(hBitmap);
 
-		curr_pixels.resize(imgW * imgH);
-		memcpy(curr_pixels.data(), curr_rgba.data(), imgW * imgH * 4);
+		BasicBitmap* currBmp = nullptr;
+		if (!CaptureScreenToBasicBitmap(currBmp)) continue;
+		int width = currBmp->Width(), height = currBmp->Height();
+		const uint8_t* curr_rgba = currBmp->Bits();
 
-		// --- DIRTY TILE: Compare prev and curr, send dirty tiles ---
+		std::vector<uint32_t> curr_pixels(width * height);
+		memcpy(curr_pixels.data(), curr_rgba, width * height * 4);
+
 		std::vector<DirtyTile> DirtyTiles;
-
 		frameCounter++;
-		// Force full frame on first frame and every 60 frames (approx every 2-3s at 20-30fps)
 		if (first || frameCounter % 60 == 0) {
 			DirtyTiles.clear();
-			DirtyTiles.push_back({ 0, 0, imgW, imgH });
-			prev_rgba = curr_rgba;
+			DirtyTiles.push_back({ 0, 0, width, height });
+			if (prevBmp) delete prevBmp;
+			prevBmp = new BasicBitmap(*currBmp);
 			prev_pixels = curr_pixels;
 			first = false;
 		}
 		else {
-			detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), imgW, imgH, DirtyTiles);
-
-			// --- NEW: If too many dirty tiles, force full frame ---
-			size_t totalTiles = ((imgW + TILE_W - 1) / TILE_W) * ((imgH + TILE_H - 1) / TILE_H);
-			if (DirtyTiles.size() > totalTiles * 0.3) { // If more than 30% of the screen is dirty, force full frame
+			detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), width, height, DirtyTiles);
+			size_t totalTiles = ((width + TILE_W - 1) / TILE_W) * ((height + TILE_H - 1) / TILE_H);
+			if (DirtyTiles.size() > totalTiles * 0.3) {
 				DirtyTiles.clear();
-				DirtyTiles.push_back({ 0, 0, imgW, imgH });
-				prev_rgba = curr_rgba;
+				DirtyTiles.push_back({ 0, 0, width, height });
+				if (prevBmp) delete prevBmp;
+				prevBmp = new BasicBitmap(*currBmp);
 				prev_pixels = curr_pixels;
 			}
 		}
 
-		// Send number of dirty tiles as uint32_t
 		uint32_t nTiles = (uint32_t)DirtyTiles.size();
 		uint32_t nTilesNet = htonl(nTiles);
 		int ret = send(sktClient, (const char*)&nTilesNet, sizeof(nTilesNet), 0);
 		if (ret != sizeof(nTilesNet)) break;
 
 		for (const auto& r : DirtyTiles) {
-			int rw = r.right - r.left, rh = r.bottom - r.top;
+			BasicBitmap* tile = extract_tile_basicbitmap(curr_rgba, width, height, r);
 			std::vector<uint8_t> qoiData;
-			QOIEncodeSubimage(curr_rgba, imgW, imgH, r, qoiData);
+			QOIEncodeBasicBitmap(tile, qoiData);
 
+			uint32_t rw = tile->Width(), rh = tile->Height();
 			uint32_t xNet = htonl(r.left);
 			uint32_t yNet = htonl(r.top);
 			uint32_t wNet = htonl(rw);
 			uint32_t hNet = htonl(rh);
 			uint32_t qoiLenNet = htonl((uint32_t)qoiData.size());
-
 			send(sktClient, (const char*)&xNet, 4, 0);
 			send(sktClient, (const char*)&yNet, 4, 0);
 			send(sktClient, (const char*)&wNet, 4, 0);
@@ -702,16 +688,17 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 				if (sent <= 0) goto END;
 				offset += sent;
 			}
-
-			bytes += qoiData.size() + 20; // 5 uint32_t fields per tile
+			bytes += qoiData.size() + 20;
+			delete tile;
 		}
-		prev_rgba = curr_rgba;
+		if (prevBmp) delete prevBmp;
+		prevBmp = new BasicBitmap(*currBmp);
 		prev_pixels = curr_pixels;
+		delete currBmp;
 
 		frames++;
 		g_screenStreamW = width;
 		g_screenStreamH = height;
-
 		auto now = steady_clock::now();
 		if (duration_cast<seconds>(now - lastPrint).count() >= 1) {
 			g_screenStreamFPS = frames;
@@ -728,157 +715,70 @@ END:
 	g_screenStreamActive = false;
 }
 
+
+
 // Store a pointer to this struct in the window's GWLP_USERDATA
 // You must set this on window creation.
 
+// --- Client streaming: receive tiles, patch framebuffer using BasicBitmap ---
 void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 	using namespace std::chrono;
 	size_t bytesLastSec = 0;
 	int framesLastSec = 0;
 	auto lastSec = steady_clock::now();
-
-	// Do NOT create/delete ScreenBitmapState here.
 	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 	if (!bmpState) {
-		OutputDebugStringA("ScreenRecvThread: bmpState is NULL!\n");
 		closesocket(skt);
 		return;
 	}
-
-	auto debug_log = [](const char* fmt, ...) {
-		char buf[512];
-		va_list ap;
-		va_start(ap, fmt);
-		vsnprintf(buf, sizeof(buf), fmt, ap);
-		va_end(ap);
-		OutputDebugStringA(buf);
-	};
-
 	bool running = true;
 	while (running) {
 		uint32_t nTilesNet = 0;
 		int ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
-		if (ret != 4) {
-			debug_log("Socket closed or error on tile count\n");
-			break;
-		}
+		if (ret != 4) break;
 		uint32_t nTiles = ntohl(nTilesNet);
-		if (nTiles == 0) {
-			debug_log("Got nTiles = 0 (keepalive?)\n");
-			continue;
-		}
-
-		size_t bytesThisFrame = 4; // nTiles field
-		bool frame_error = false;
-		bool fullScreenInvalidation = false;
-
-		std::vector<RECT> invalidateRects; // Store per-tile rects
-
+		if (nTiles == 0) continue;
+		size_t bytesThisFrame = 4;
+		bool frame_error = false, fullScreenInvalidation = false;
+		std::vector<RECT> invalidateRects;
 		for (uint32_t i = 0; i < nTiles; ++i) {
 			uint32_t x, y, w, h, qoiLen;
 			int got;
-
 			got = recv(skt, (char*)&x, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			got = recv(skt, (char*)&y, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			got = recv(skt, (char*)&w, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			got = recv(skt, (char*)&h, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			got = recv(skt, (char*)&qoiLen, 4, MSG_WAITALL); if (got != 4) { frame_error = true; running = false; break; }
 			bytesThisFrame += 4 * 5;
-
 			x = ntohl(x); y = ntohl(y); w = ntohl(w); h = ntohl(h); qoiLen = ntohl(qoiLen);
-
-			if (w == 0 || h == 0 || qoiLen == 0) {
-				debug_log("Invalid tile: w=%u h=%u qoiLen=%u\n", w, h, qoiLen);
-				continue;
-			}
-
 			std::vector<uint8_t> qoiData(qoiLen);
 			size_t offset = 0;
 			while (offset < qoiLen) {
 				got = recv(skt, (char*)(qoiData.data() + offset), qoiLen - offset, 0);
-				if (got <= 0) {
-					debug_log("Socket closed or error on qoi data\n");
-					frame_error = true;
-					running = false;
-					break;
-				}
+				if (got <= 0) { frame_error = true; running = false; break; }
 				offset += got;
 				bytesThisFrame += got;
 			}
 			if (!running) break;
-
-			qoi_desc desc;
-			uint8_t* decoded = (uint8_t*)qoi_decode(qoiData.data(), qoiLen, &desc, 4);
-			if (!decoded) {
-				debug_log("qoi_decode failed\n");
-				continue;
-			}
-
-			// --- All bitmap and framebuffer mutation must be done together under lock ---
+			BasicBitmap* tileBmp = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
+			if (!tileBmp) continue;
 			EnterCriticalSection(&bmpState->cs);
-
-			int needW = std::max(bmpState->imgW, static_cast<int>(x + w));
-			int needH = std::max(bmpState->imgH, static_cast<int>(y + h));
-			bool needRealloc = (bmpState->hBitmap == NULL) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
-
+			int needW = std::max(bmpState->imgW, (int)(x + w));
+			int needH = std::max(bmpState->imgH, (int)(y + h));
+			bool needRealloc = (bmpState->bmp == nullptr) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
 			if (needRealloc) {
-				// Allocate new bitmap and framebuffer
-				BITMAPINFO bmi = { 0 };
-				bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-				bmi.bmiHeader.biWidth = needW;
-				bmi.bmiHeader.biHeight = -needH;
-				bmi.bmiHeader.biPlanes = 1;
-				bmi.bmiHeader.biBitCount = 32;
-				bmi.bmiHeader.biCompression = BI_RGB;
-
-				void* newDibBits = nullptr;
-				HBITMAP newBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &newDibBits, NULL, 0);
-
-				if (!newBitmap || !newDibBits) {
-					debug_log("CreateDIBSection failed (w=%d h=%d)\n", needW, needH);
-					LeaveCriticalSection(&bmpState->cs);
-					free(decoded);
-					frame_error = true;
-					running = false;
-					break;
-				}
-
-				if (bmpState->hBitmap) DeleteObject(bmpState->hBitmap);
-				bmpState->hBitmap = newBitmap;
-				bmpState->dibBits = newDibBits;
+				if (bmpState->bmp) delete bmpState->bmp;
+				bmpState->bmp = new BasicBitmap(needW, needH, BasicBitmap::A8R8G8B8);
 				bmpState->imgW = needW;
 				bmpState->imgH = needH;
-				bmpState->framebuffer.assign(needW * needH * 4, 0xCC); // magenta for debug
-
-				debug_log("Allocated new bitmap (%d x %d)\n", needW, needH);
 			}
-
-			// Patch decoded region into framebuffer (with bounds check)
 			for (uint32_t row = 0; row < h; ++row) {
 				if ((y + row) >= (uint32_t)bmpState->imgH || x >= (uint32_t)bmpState->imgW) continue;
-				uint8_t* dst = &bmpState->framebuffer[((y + row) * bmpState->imgW + x) * 4];
-				uint8_t* src = &decoded[(row * w) * 4];
-				uint32_t copyBytes = std::min(w, (uint32_t)(bmpState->imgW - x)) * 4;
-				if (copyBytes > 0 &&
-					(dst >= bmpState->framebuffer.data()) &&
-					(dst + copyBytes <= bmpState->framebuffer.data() + bmpState->framebuffer.size())) {
-					for (uint32_t col = 0; col < copyBytes; col += 4) {
-						dst[col + 0] = src[col + 2];
-						dst[col + 1] = src[col + 1];
-						dst[col + 2] = src[col + 0];
-						dst[col + 3] = src[col + 3];
-					}
-				}
+				uint8_t* dst = bmpState->bmp->Bits() + ((y + row) * bmpState->imgW + x) * 4;
+				uint8_t* src = tileBmp->Bits() + row * w * 4;
+				memcpy(dst, src, w * 4);
 			}
-			// Always update the DIBSection after framebuffer update
-			size_t needBytes = (size_t)bmpState->imgW * bmpState->imgH * 4;
-			if (bmpState->hBitmap && bmpState->dibBits && bmpState->framebuffer.size() == needBytes) {
-				memcpy(bmpState->dibBits, bmpState->framebuffer.data(), needBytes);
-			}
-
-			// --- Per-tile/fullscreen InvalidateRect logic ---
 			if (x == 0 && y == 0 && w == (uint32_t)bmpState->imgW && h == (uint32_t)bmpState->imgH) {
-				// This is a full-screen update, so mark for full-window invalidation (once per frame)
 				fullScreenInvalidation = true;
 			}
 			else {
@@ -889,12 +789,9 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				tileRect.bottom = y + h;
 				invalidateRects.push_back(tileRect);
 			}
-
 			LeaveCriticalSection(&bmpState->cs);
-			free(decoded);
+			delete tileBmp;
 		}
-
-		// Invalidate all changed tiles (outside the lock)
 		if (fullScreenInvalidation) {
 			InvalidateRect(hwnd, NULL, FALSE);
 		}
@@ -903,9 +800,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 				InvalidateRect(hwnd, &r, FALSE);
 			}
 		}
-
 		if (frame_error) break;
-
 		framesLastSec++;
 		bytesLastSec += bytesThisFrame;
 		auto now = steady_clock::now();
@@ -919,7 +814,6 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
 			snprintf(title, sizeof(title), "Remote Screen | IP: %s | FPS: %d | Mbps: %.2f | Size: %dx%d",
 				ip.c_str(), framesLastSec, mbps, winW, winH);
 			PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
-			debug_log("FPS: %d, Mbps: %.2f\n", framesLastSec, mbps);
 			bytesLastSec = 0;
 			framesLastSec = 0;
 			lastSec = now;
@@ -1372,6 +1266,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	case WM_ERASEBKGND:
 		return 1; // Prevent flicker
 
+// --- In WM_PAINT: blit BasicBitmap to window (using DIBSection for output) ---
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
@@ -1407,7 +1302,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			doubleBufW = destW;
 			doubleBufH = destH;
 			if (pDoubleBufBits)
-				memset(pDoubleBufBits, 0xCC, destW * destH * 4); // For debug
+				memset(pDoubleBufBits, 0xCC, destW * destH * 4);
 		}
 
 		HDC hdcBuf = CreateCompatibleDC(hdc);
@@ -1417,57 +1312,65 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		FillRect(hdcBuf, &clientRect, brush);
 		DeleteObject(brush);
 
-		if (bmpState) {
+		ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+		if (bmpState && bmpState->bmp) {
 			EnterCriticalSection(&bmpState->cs);
-			if (bmpState->hBitmap && bmpState->dibBits) {
-				BITMAP bm = {};
-				if (GetObject(bmpState->hBitmap, sizeof(bm), &bm) == sizeof(bm) && bm.bmWidth > 0 && bm.bmHeight > 0) {
-					int srcW = bm.bmWidth;
-					int srcH = bm.bmHeight;
-
-					double srcAspect = (double)srcW / srcH;
-					double destAspect = (double)destW / destH;
-					int drawW, drawH, offsetX, offsetY;
-					if (destAspect > srcAspect) {
-						drawH = destH;
-						drawW = (int)(drawH * srcAspect);
-						offsetX = (destW - drawW) / 2;
-						offsetY = 0;
-					}
-					else {
-						drawW = destW;
-						drawH = (int)(drawW / srcAspect);
-						offsetX = 0;
-						offsetY = (destH - drawH) / 2;
-					}
-
-					HDC hMem = CreateCompatibleDC(hdcBuf);
-					HGDIOBJ oldObj = SelectObject(hMem, bmpState->hBitmap);
-
-					if (drawW == srcW && drawH == srcH) {
-						BitBlt(hdcBuf, offsetX, offsetY, srcW, srcH, hMem, 0, 0, SRCCOPY);
-					}
-					else {
-						SetStretchBltMode(hdcBuf, COLORONCOLOR);
-						StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
-					}
-
-					SelectObject(hMem, oldObj);
-					DeleteDC(hMem);
-				}
+			int srcW = bmpState->bmp->Width();
+			int srcH = bmpState->bmp->Height();
+			double srcAspect = (double)srcW / srcH;
+			double destAspect = (double)destW / destH;
+			int drawW, drawH, offsetX, offsetY;
+			if (destAspect > srcAspect) {
+				drawH = destH;
+				drawW = (int)(drawH * srcAspect);
+				offsetX = (destW - drawW) / 2;
+				offsetY = 0;
 			}
+			else {
+				drawW = destW;
+				drawH = (int)(drawW / srcAspect);
+				offsetX = 0;
+				offsetY = (destH - drawH) / 2;
+			}
+
+			// 1. Allocate a temp DIBSection for the BasicBitmap image, if needed.
+			BITMAPINFO bmi = { 0 };
+			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+			bmi.bmiHeader.biWidth = srcW;
+			bmi.bmiHeader.biHeight = -srcH;
+			bmi.bmiHeader.biPlanes = 1;
+			bmi.bmiHeader.biBitCount = 32;
+			bmi.bmiHeader.biCompression = BI_RGB;
+			void* pBits = nullptr;
+			HBITMAP hBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+
+			// 2. Copy RGBA from BasicBitmap to BGRA for the DIBSection.
+			uint8_t* src = bmpState->bmp->Bits();
+			uint8_t* dst = (uint8_t*)pBits;
+			for (int i = 0; i < srcW * srcH; ++i) {
+				dst[i * 4 + 0] = src[i * 4 + 2]; // B
+				dst[i * 4 + 1] = src[i * 4 + 1]; // G
+				dst[i * 4 + 2] = src[i * 4 + 0]; // R
+				dst[i * 4 + 3] = 255;            // A
+			}
+
+			// 3. Draw/scaledraw the temp DIBSection to the double buffer.
+			HDC hMem = CreateCompatibleDC(hdcBuf);
+			HGDIOBJ oldObj = SelectObject(hMem, hBmp);
+			SetStretchBltMode(hdcBuf, COLORONCOLOR);
+			StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+			SelectObject(hMem, oldObj);
+			DeleteDC(hMem);
+			DeleteObject(hBmp);
 			LeaveCriticalSection(&bmpState->cs);
 		}
-
 		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
-
 		SelectObject(hdcBuf, oldBufBmp);
 		DeleteDC(hdcBuf);
-
 		EndPaint(hwnd, &ps);
 		break;
 	}
-	case WM_DESTROY: {
+    	case WM_DESTROY: {
 		static HBITMAP hDoubleBufBmp = NULL;
 		static void* pDoubleBufBits = NULL;
 		if (hDoubleBufBmp) {
