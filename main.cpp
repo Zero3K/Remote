@@ -609,15 +609,12 @@ int CloseConnection(SOCKET* sktConn) {
 
 // =================== SCREEN STREAM SERVER =====================
 
-// --- Server streaming: send tiles using BasicBitmap for all buffer ops ---
+// Optimized server thread: no whole-frame memcpy, uses row-by-row memcmp for dirty tile detection.
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 
-	// Use unique_ptr since BasicBitmap has no default constructor
 	std::unique_ptr<BasicBitmap> prevBmp;
 	std::unique_ptr<BasicBitmap> currBmp;
-	std::vector<uint32_t> prev_pixels;
-	std::vector<uint32_t> curr_pixels;
 	bool first = true;
 	static int frameCounter = 0;
 
@@ -637,16 +634,12 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		// --- Capture into a new BasicBitmap ---
 		BasicBitmap* pBmp = nullptr;
 		if (!CaptureScreenToBasicBitmap(pBmp)) continue;
-		currBmp.reset(pBmp); // take ownership
-
-		if (!currBmp) continue; // safety check
+		currBmp.reset(pBmp);
+		if (!currBmp) continue;
 
 		int width = currBmp->Width();
 		int height = currBmp->Height();
 		const uint8_t* curr_rgba = currBmp->Bits();
-
-		curr_pixels.resize(width * height);
-		memcpy(curr_pixels.data(), curr_rgba, width * height * 4);
 
 		std::vector<DirtyTile> DirtyTiles;
 		frameCounter++;
@@ -654,23 +647,39 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			DirtyTiles.clear();
 			DirtyTiles.push_back({ 0, 0, width, height });
 			prevBmp = std::make_unique<BasicBitmap>(*currBmp);
-			prev_pixels = curr_pixels;
 			first = false;
 		}
 		else {
-			if (prevBmp && prev_pixels.size() == curr_pixels.size()) {
-				detect_dirty_tiles(prev_pixels.data(), curr_pixels.data(), width, height, DirtyTiles);
+			if (prevBmp && prevBmp->Width() == width && prevBmp->Height() == height) {
+				// --- Optimized dirty tile detection: row-by-row memcmp, no frame memcpy ---
+				const uint8_t* prev = prevBmp->Bits();
+				size_t tiles_x = (width + TILE_W - 1) / TILE_W;
+				size_t tiles_y = (height + TILE_H - 1) / TILE_H;
+				for (size_t ty = 0; ty < tiles_y; ++ty) {
+					for (size_t tx = 0; tx < tiles_x; ++tx) {
+						int tileLeft = tx * TILE_W;
+						int tileTop = ty * TILE_H;
+						int tileW = std::min(TILE_W, width - tileLeft);
+						int tileH = std::min(TILE_H, height - tileTop);
+						bool dirty = false;
+						for (int row = 0; row < tileH; ++row) {
+							int y = tileTop + row;
+							const uint8_t* prevRow = prev + (y * width + tileLeft) * 4;
+							const uint8_t* currRow = curr_rgba + (y * width + tileLeft) * 4;
+							if (memcmp(prevRow, currRow, tileW * 4) != 0) {
+								dirty = true;
+								break;
+							}
+						}
+						if (dirty) {
+							DirtyTiles.push_back({ tileLeft, tileTop, tileLeft + tileW, tileTop + tileH });
+						}
+					}
+				}
 			}
 			else {
 				DirtyTiles.clear();
 				DirtyTiles.push_back({ 0, 0, width, height });
-			}
-			size_t totalTiles = ((width + TILE_W - 1) / TILE_W) * ((height + TILE_H - 1) / TILE_H);
-			if (DirtyTiles.size() > totalTiles * 0.3) {
-				DirtyTiles.clear();
-				DirtyTiles.push_back({ 0, 0, width, height });
-				prevBmp = std::make_unique<BasicBitmap>(*currBmp);
-				prev_pixels = curr_pixels;
 			}
 		}
 
@@ -710,8 +719,8 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			}
 			bytes += qoiData.size() + 20;
 		}
+		// Only update prevBmp after sending tiles
 		prevBmp = std::make_unique<BasicBitmap>(*currBmp);
-		prev_pixels = curr_pixels;
 
 		frames++;
 		g_screenStreamW = width;
