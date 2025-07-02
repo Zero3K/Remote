@@ -424,7 +424,7 @@ std::atomic<int> g_screenStreamH(0);
 // Streaming server/client declarations
 void ScreenStreamServerThread(SOCKET sktClient);
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip);
+void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port);
 void StartScreenRecv(std::string server_ip, int port);
 
 void ServerInputRecvThread(SOCKET clientSocket);
@@ -847,260 +847,376 @@ END:
 #define SRDPRINTF(...) do {} while (0)
 #endif
 
-void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip) {
+// Set "Reconnecting..." in the title bar
+inline void SetReconnectingTitle(HWND hwnd, const std::string& ip) {
+	char title[256];
+	snprintf(title, sizeof(title), "Remote Screen | IP: %s | Reconnecting...", ip.c_str());
+	PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
+}
+
+// Check if window is still valid (window not closed by user)
+bool WindowStillOpen(HWND hwnd) {
+	return (hwnd && IsWindow(hwnd));
+}
+
+// --- Main auto-reconnecting receive thread ---// Utility: Get remote IP and port from a connected socket
+inline std::pair<std::string, int> GetPeerIpAndPort(SOCKET skt) {
+	sockaddr_in addr = {};
+	int addrlen = sizeof(addr);
+	if (getpeername(skt, (sockaddr*)&addr, &addrlen) == 0) {
+		char ipstr[INET_ADDRSTRLEN] = {};
+		inet_ntop(AF_INET, &addr.sin_addr, ipstr, sizeof(ipstr));
+		int port = ntohs(addr.sin_port);
+		return { std::string(ipstr), port };
+	}
+	return { "", 0 };
+}
+
+// Set window title with connection info
+inline void SetConnectionTitle(HWND hwnd, const std::string& ip, int port, const char* status) {
+	char title[256];
+	if (!ip.empty() && port != 0)
+		snprintf(title, sizeof(title), "Remote Screen | IP: %s | Port: %d | %s", ip.c_str(), port, status);
+	else
+		snprintf(title, sizeof(title), "Remote Screen | %s", status);
+	PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
+}
+
+void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 	using namespace std::chrono;
-	SRDPRINTF("ScreenRecvThread: started\n");
+	std::string last_ip = ip;
+	int last_port = server_port;
 
-	// --- RECEIVE WIDTH/HEIGHT FROM SERVER ---
-	uint32_t widthNet = 0, heightNet = 0;
-	int got = recv(skt, (char*)&widthNet, 4, MSG_WAITALL);
-	if (got != 4) {
-		SRDPRINTF("ScreenRecvThread: recv for width failed, got=%d\n", got);
-		closesocket(skt);
-		return;
-	}
-	got = recv(skt, (char*)&heightNet, 4, MSG_WAITALL);
-	if (got != 4) {
-		SRDPRINTF("ScreenRecvThread: recv for height failed, got=%d\n", got);
-		closesocket(skt);
-		return;
-	}
-	g_screenStreamW = ntohl(widthNet);
-	g_screenStreamH = ntohl(heightNet);
-	SRDPRINTF("ScreenRecvThread: received screen size: %dx%d\n", g_screenStreamW.load(), g_screenStreamH.load());
-
-	size_t bytesLastSec = 0;
-	int framesLastSec = 0;
-	auto lastSec = steady_clock::now();
-
-	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-	if (!bmpState) {
-		SRDPRINTF("ScreenRecvThread: bmpState is NULL, exiting\n");
-		closesocket(skt);
-		return;
-	}
-
-	std::vector<RECT> invalidateRects;
-	std::vector<uint8_t> qoiData;
-	bool running = true;
-
-	while (running) {
-		uint32_t xrleBitmaskLenNet = 0;
-		int ret = recv(skt, (char*)&xrleBitmaskLenNet, 4, MSG_WAITALL);
-		if (ret != 4) {
-			SRDPRINTF("ScreenRecvThread: recv for bitmask length failed, ret=%d\n", ret);
-			break;
-		}
-		uint32_t xrleBitmaskLen = ntohl(xrleBitmaskLenNet);
-		SRDPRINTF("ScreenRecvThread: xrleBitmaskLen = %u\n", xrleBitmaskLen);
-
-		if (xrleBitmaskLen == 0 || xrleBitmaskLen > 1024 * 1024) {
-			SRDPRINTF("ScreenRecvThread: xrleBitmaskLen out of range, exiting\n");
-			break;
+	while (true) {
+		// If user closed window, exit immediately
+		if (!WindowStillOpen(hwnd)) {
+			SRDPRINTF("ScreenRecvThread: User closed window, exiting.\n");
+			if (skt != INVALID_SOCKET) closesocket(skt);
+			return;
 		}
 
-		std::vector<uint8_t> xrleBitmask(xrleBitmaskLen);
-		size_t offset = 0;
-		while (offset < xrleBitmaskLen) {
-			int got = recv(skt, (char*)(xrleBitmask.data() + offset), xrleBitmaskLen - offset, 0);
-			if (got <= 0) {
-				SRDPRINTF("ScreenRecvThread: recv for xrleBitmask data failed, got=%d offset=%zu\n", got, offset);
-				running = false;
-				break;
-			}
-			offset += got;
-		}
-		if (!running) {
-			SRDPRINTF("ScreenRecvThread: !running after xrleBitmask\n");
-			break;
-		}
+		// -- Try to connect if needed (or on reconnect) --
+		if (skt == INVALID_SOCKET) {
+			SetConnectionTitle(hwnd, last_ip, last_port, "Reconnecting...");
+			SRDPRINTF("ScreenRecvThread: Attempting to connect to %s:%d...\n", last_ip.c_str(), last_port);
 
-		int width = g_screenStreamW.load();
-		int height = g_screenStreamH.load();
-		SRDPRINTF("ScreenRecvThread: width=%d height=%d\n", width, height);
-		if (width <= 0 || height <= 0) {
-			SRDPRINTF("ScreenRecvThread: Invalid width/height, exiting\n");
-			break;
-		}
-
-		size_t tiles_x = (width + TILE_W - 1) / TILE_W;
-		size_t tiles_y = (height + TILE_H - 1) / TILE_H;
-		size_t numTiles = tiles_x * tiles_y;
-		if (numTiles == 0 || numTiles > 100000) {
-			SRDPRINTF("ScreenRecvThread: numTiles out of range (%zu), exiting\n", numTiles);
-			break;
-		}
-
-		std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8);
-		size_t gotLen = xrle_decompress(dirtyBitmask.data(), xrleBitmask.data(), xrleBitmask.size());
-		SRDPRINTF("ScreenRecvThread: gotLen from xrle_decompress = %zu, expected = %zu\n", gotLen, dirtyBitmask.size());
-		if (gotLen != dirtyBitmask.size()) {
-			SRDPRINTF("ScreenRecvThread: xrle_decompress size mismatch, exiting\n");
-			break;
-		}
-
-		size_t dirtyCount = 0;
-		SRDPRINTF("ScreenRecvThread: tiles_x=%zu tiles_y=%zu numTiles=%zu\n", tiles_x, tiles_y, numTiles);
-		SRDPRINTF("ScreenRecvThread: DirtyBitmask: ");
-		for (size_t b = 0; b < dirtyBitmask.size(); ++b) {
-			SRDPRINTF("%02X", dirtyBitmask[b]);
-			for (int bit = 0; bit < 8; ++bit)
-				if (dirtyBitmask[b] & (1 << bit))
-					dirtyCount++;
-		}
-		SRDPRINTF("\nScreenRecvThread: dirtyCount=%zu\n", dirtyCount);
-
-		uint32_t nTilesNet = 0;
-		ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
-		if (ret != 4) {
-			SRDPRINTF("ScreenRecvThread: recv for nTiles failed, ret=%d\n", ret);
-			break;
-		}
-		uint32_t nTiles = ntohl(nTilesNet);
-		SRDPRINTF("ScreenRecvThread: nTiles (server says) = %u\n", nTiles);
-
-		size_t bytesThisFrame = 4;
-		bool frame_error = false, fullScreenInvalidation = false;
-		invalidateRects.clear();
-
-		size_t receivedDirty = 0;
-		for (size_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
-			if (!(dirtyBitmask[tileIdx / 8] & (1 << (tileIdx % 8))))
+			skt = socket(AF_INET, SOCK_STREAM, 0);
+			if (skt == INVALID_SOCKET) {
+				SRDPRINTF("ScreenRecvThread: socket() failed\n");
+				std::this_thread::sleep_for(std::chrono::seconds(2));
 				continue;
-
-			size_t tx = tileIdx % tiles_x;
-			size_t ty = tileIdx / tiles_x;
-			uint32_t x = static_cast<uint32_t>(tx * TILE_W);
-			uint32_t y = static_cast<uint32_t>(ty * TILE_H);
-			uint32_t w = std::min<uint32_t>(TILE_W, static_cast<uint32_t>(std::max(0, width - (int)x)));
-			uint32_t h = std::min<uint32_t>(TILE_H, static_cast<uint32_t>(std::max(0, height - (int)y)));
-
-			SRDPRINTF("ScreenRecvThread: expecting tile #%zu at grid (%zu,%zu) x=%u y=%u w=%u h=%u\n",
-				receivedDirty, tx, ty, x, y, w, h);
-
-			uint32_t rx, ry, rw, rh, xrleLen, qoiOrigLen;
-			int got;
-			got = recv(skt, (char*)&rx, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rx failed, got=%d\n", got); frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&ry, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv ry failed, got=%d\n", got); frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&rw, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rw failed, got=%d\n", got); frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&rh, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rh failed, got=%d\n", got); frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&xrleLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv xrleLen failed, got=%d\n", got); frame_error = true; running = false; break; }
-			got = recv(skt, (char*)&qoiOrigLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv qoiOrigLen failed, got=%d\n", got); frame_error = true; running = false; break; }
-			bytesThisFrame += 4 * 6;
-			rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh); xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
-
-			SRDPRINTF("ScreenRecvThread: received header for tile #%zu: rx=%u ry=%u rw=%u rh=%u xrleLen=%u qoiOrigLen=%u\n",
-				receivedDirty, rx, ry, rw, rh, xrleLen, qoiOrigLen);
-
-			if (rw == 0 || rh == 0 || xrleLen == 0 || qoiOrigLen == 0) {
-				SRDPRINTF("ScreenRecvThread: zero/invalid header value, frame_error\n");
-				frame_error = true; running = false; break;
 			}
 
-			std::vector<uint8_t> xrleData(xrleLen);
-			size_t offset2 = 0;
-			while (offset2 < xrleLen) {
-				got = recv(skt, (char*)(xrleData.data() + offset2), xrleLen - offset2, 0);
-				if (got <= 0) {
-					SRDPRINTF("ScreenRecvThread: recv for xrleData failed, got=%d offset2=%zu\n", got, offset2);
-					frame_error = true; running = false; break;
+			sockaddr_in addr = {};
+			addr.sin_family = AF_INET;
+			addr.sin_port = htons(static_cast<u_short>(last_port));
+			inet_pton(AF_INET, last_ip.c_str(), &addr.sin_addr);
+
+			int connect_result = connect(skt, (sockaddr*)&addr, sizeof(addr));
+			if (connect_result == SOCKET_ERROR) {
+				int lastErr = WSAGetLastError();
+				closesocket(skt);
+				skt = INVALID_SOCKET;
+				if (lastErr == WSAECONNREFUSED || lastErr == WSAHOST_NOT_FOUND) {
+					MessageBoxW(hwnd, L"Server is not running or unreachable.\nStopping auto-reconnect.", L"Connection Failed", MB_OK | MB_ICONERROR);
+					return;
 				}
-				offset2 += got;
-				bytesThisFrame += got;
+				std::this_thread::sleep_for(std::chrono::seconds(2));
+				continue;
 			}
-			if (!running) {
-				SRDPRINTF("ScreenRecvThread: !running after tile data\n");
+			SRDPRINTF("ScreenRecvThread: Connected!\n");
+			// Fetch the real remote connection info
+			std::tie(last_ip, last_port) = GetPeerIpAndPort(skt);
+		}
+
+		SetConnectionTitle(hwnd, last_ip, last_port, "Connected");
+
+		// -- Check for user close before starting streaming --
+		if (!WindowStillOpen(hwnd)) {
+			closesocket(skt);
+			return;
+		}
+
+		// --- RECEIVE WIDTH/HEIGHT FROM SERVER ---
+		uint32_t widthNet = 0, heightNet = 0;
+		int got = recv(skt, (char*)&widthNet, 4, MSG_WAITALL);
+		if (got != 4) {
+			SRDPRINTF("ScreenRecvThread: recv for width failed, got=%d\n", got);
+			closesocket(skt);
+			skt = INVALID_SOCKET;
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+			continue;
+		}
+		got = recv(skt, (char*)&heightNet, 4, MSG_WAITALL);
+		if (got != 4) {
+			SRDPRINTF("ScreenRecvThread: recv for height failed, got=%d\n", got);
+			closesocket(skt);
+			skt = INVALID_SOCKET;
+			std::this_thread::sleep_for(std::chrono::seconds(2));
+			continue;
+		}
+		g_screenStreamW = ntohl(widthNet);
+		g_screenStreamH = ntohl(heightNet);
+		SRDPRINTF("ScreenRecvThread: received screen size: %dx%d\n", g_screenStreamW.load(), g_screenStreamH.load());
+
+		if (!WindowStillOpen(hwnd)) {
+			closesocket(skt);
+			return;
+		}
+
+		size_t bytesLastSec = 0;
+		int framesLastSec = 0;
+		auto lastSec = steady_clock::now();
+
+		ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+		if (!bmpState) {
+			SRDPRINTF("ScreenRecvThread: bmpState is NULL, exiting\n");
+			closesocket(skt);
+			return;
+		}
+
+		std::vector<RECT> invalidateRects;
+		std::vector<uint8_t> qoiData;
+		bool running = true;
+		bool lost_connection = false;
+
+		// --- Streaming loop ---
+		while (running) {
+			if (!WindowStillOpen(hwnd)) {
+				closesocket(skt);
+				return;
+			}
+
+			uint32_t xrleBitmaskLenNet = 0;
+			int ret = recv(skt, (char*)&xrleBitmaskLenNet, 4, MSG_WAITALL);
+			if (ret != 4) {
+				SRDPRINTF("ScreenRecvThread: recv for bitmask length failed, ret=%d\n", ret);
+				lost_connection = true;
+				break;
+			}
+			uint32_t xrleBitmaskLen = ntohl(xrleBitmaskLenNet);
+			SRDPRINTF("ScreenRecvThread: xrleBitmaskLen = %u\n", xrleBitmaskLen);
+
+			if (xrleBitmaskLen == 0 || xrleBitmaskLen > 1024 * 1024) {
+				SRDPRINTF("ScreenRecvThread: xrleBitmaskLen out of range, exiting\n");
+				lost_connection = true;
 				break;
 			}
 
-			qoiData.resize(qoiOrigLen);
-			size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
-			if (qoiLen != qoiOrigLen) {
-				SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
-				frame_error = true; running = false; break;
-			}
-			qoiData.resize(qoiLen);
-
-			std::unique_ptr<BasicBitmap> tileBmp;
-			{
-				BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
-				if (!decoded) {
-					SRDPRINTF("ScreenRecvThread: QOIDecodeToBasicBitmap failed for tile #%zu\n", receivedDirty);
-					continue;
+			std::vector<uint8_t> xrleBitmask(xrleBitmaskLen);
+			size_t offset = 0;
+			while (offset < xrleBitmaskLen) {
+				int got = recv(skt, (char*)(xrleBitmask.data() + offset), xrleBitmaskLen - offset, 0);
+				if (got <= 0) {
+					SRDPRINTF("ScreenRecvThread: recv for xrleBitmask data failed, got=%d offset=%zu\n", got, offset);
+					lost_connection = true;
+					running = false;
+					break;
 				}
-				tileBmp.reset(decoded);
+				offset += got;
+			}
+			if (!running || lost_connection) {
+				SRDPRINTF("ScreenRecvThread: !running after xrleBitmask\n");
+				break;
 			}
 
-			EnterCriticalSection(&bmpState->cs);
-			int needW = std::max(bmpState->imgW, (int)(rx + rw));
-			int needH = std::max(bmpState->imgH, (int)(ry + rh));
-			bool needRealloc = (bmpState->bmp == nullptr) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
-			if (needRealloc) {
-				if (bmpState->bmp) delete bmpState->bmp;
-				bmpState->bmp = new BasicBitmap(needW, needH, BasicBitmap::A8R8G8B8);
-				bmpState->imgW = needW;
-				bmpState->imgH = needH;
+			int width = g_screenStreamW.load();
+			int height = g_screenStreamH.load();
+			SRDPRINTF("ScreenRecvThread: width=%d height=%d\n", width, height);
+			if (width <= 0 || height <= 0) {
+				SRDPRINTF("ScreenRecvThread: Invalid width/height, exiting\n");
+				lost_connection = true;
+				break;
 			}
-			for (uint32_t row = 0; row < rh; ++row) {
-				if ((ry + row) >= (uint32_t)bmpState->imgH || rx >= (uint32_t)bmpState->imgW) continue;
-				uint8_t* dst = bmpState->bmp->Bits() + ((ry + row) * bmpState->imgW + rx) * 4;
-				uint8_t* src = tileBmp->Bits() + row * rw * 4;
-				memcpy(dst, src, rw * 4);
+
+			size_t tiles_x = (width + TILE_W - 1) / TILE_W;
+			size_t tiles_y = (height + TILE_H - 1) / TILE_H;
+			size_t numTiles = tiles_x * tiles_y;
+			if (numTiles == 0 || numTiles > 100000) {
+				SRDPRINTF("ScreenRecvThread: numTiles out of range (%zu), exiting\n", numTiles);
+				lost_connection = true;
+				break;
 			}
-			if (rx == 0 && ry == 0 && rw == (uint32_t)bmpState->imgW && rh == (uint32_t)bmpState->imgH) {
-				fullScreenInvalidation = true;
+
+			std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8);
+			size_t gotLen = xrle_decompress(dirtyBitmask.data(), xrleBitmask.data(), xrleBitmask.size());
+			SRDPRINTF("ScreenRecvThread: gotLen from xrle_decompress = %zu, expected = %zu\n", gotLen, dirtyBitmask.size());
+			if (gotLen != dirtyBitmask.size()) {
+				SRDPRINTF("ScreenRecvThread: xrle_decompress size mismatch, exiting\n");
+				lost_connection = true;
+				break;
+			}
+
+			size_t dirtyCount = 0;
+			SRDPRINTF("ScreenRecvThread: tiles_x=%zu tiles_y=%zu numTiles=%zu\n", tiles_x, tiles_y, numTiles);
+			SRDPRINTF("ScreenRecvThread: DirtyBitmask: ");
+			for (size_t b = 0; b < dirtyBitmask.size(); ++b) {
+				SRDPRINTF("%02X", dirtyBitmask[b]);
+				for (int bit = 0; bit < 8; ++bit)
+					if (dirtyBitmask[b] & (1 << bit))
+						dirtyCount++;
+			}
+			SRDPRINTF("\nScreenRecvThread: dirtyCount=%zu\n", dirtyCount);
+
+			uint32_t nTilesNet = 0;
+			ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
+			if (ret != 4) {
+				SRDPRINTF("ScreenRecvThread: recv for nTiles failed, ret=%d\n", ret);
+				lost_connection = true;
+				break;
+			}
+			uint32_t nTiles = ntohl(nTilesNet);
+			SRDPRINTF("ScreenRecvThread: nTiles (server says) = %u\n", nTiles);
+
+			size_t bytesThisFrame = 4;
+			bool frame_error = false, fullScreenInvalidation = false;
+			invalidateRects.clear();
+
+			size_t receivedDirty = 0;
+			for (size_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+				if (!(dirtyBitmask[tileIdx / 8] & (1 << (tileIdx % 8))))
+					continue;
+
+				size_t tx = tileIdx % tiles_x;
+				size_t ty = tileIdx / tiles_x;
+				uint32_t x = static_cast<uint32_t>(tx * TILE_W);
+				uint32_t y = static_cast<uint32_t>(ty * TILE_H);
+				uint32_t w = std::min<uint32_t>(TILE_W, static_cast<uint32_t>(std::max(0, width - (int)x)));
+				uint32_t h = std::min<uint32_t>(TILE_H, static_cast<uint32_t>(std::max(0, height - (int)y)));
+
+				SRDPRINTF("ScreenRecvThread: expecting tile #%zu at grid (%zu,%zu) x=%u y=%u w=%u h=%u\n",
+					receivedDirty, tx, ty, x, y, w, h);
+
+				uint32_t rx, ry, rw, rh, xrleLen, qoiOrigLen;
+				int got;
+				got = recv(skt, (char*)&rx, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rx failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				got = recv(skt, (char*)&ry, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv ry failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				got = recv(skt, (char*)&rw, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rw failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				got = recv(skt, (char*)&rh, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rh failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				got = recv(skt, (char*)&xrleLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv xrleLen failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				got = recv(skt, (char*)&qoiOrigLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv qoiOrigLen failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				bytesThisFrame += 4 * 6;
+				rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh); xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
+
+				SRDPRINTF("ScreenRecvThread: received header for tile #%zu: rx=%u ry=%u rw=%u rh=%u xrleLen=%u qoiOrigLen=%u\n",
+					receivedDirty, rx, ry, rw, rh, xrleLen, qoiOrigLen);
+
+				if (rw == 0 || rh == 0 || xrleLen == 0 || qoiOrigLen == 0) {
+					SRDPRINTF("ScreenRecvThread: zero/invalid header value, frame_error\n");
+					frame_error = true; lost_connection = true; running = false; break;
+				}
+
+				std::vector<uint8_t> xrleData(xrleLen);
+				size_t offset2 = 0;
+				while (offset2 < xrleLen) {
+					got = recv(skt, (char*)(xrleData.data() + offset2), xrleLen - offset2, 0);
+					if (got <= 0) {
+						SRDPRINTF("ScreenRecvThread: recv for xrleData failed, got=%d offset2=%zu\n", got, offset2);
+						frame_error = true; lost_connection = true; running = false; break;
+					}
+					offset2 += got;
+					bytesThisFrame += got;
+				}
+				if (!running || lost_connection) {
+					SRDPRINTF("ScreenRecvThread: !running after tile data\n");
+					break;
+				}
+
+				qoiData.resize(qoiOrigLen);
+				size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
+				if (qoiLen != qoiOrigLen) {
+					SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
+					frame_error = true; lost_connection = true; running = false; break;
+				}
+				qoiData.resize(qoiLen);
+
+				std::unique_ptr<BasicBitmap> tileBmp;
+				{
+					BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
+					if (!decoded) {
+						SRDPRINTF("ScreenRecvThread: QOIDecodeToBasicBitmap failed for tile #%zu\n", receivedDirty);
+						continue;
+					}
+					tileBmp.reset(decoded);
+				}
+
+				EnterCriticalSection(&bmpState->cs);
+				int needW = std::max(bmpState->imgW, (int)(rx + rw));
+				int needH = std::max(bmpState->imgH, (int)(ry + rh));
+				bool needRealloc = (bmpState->bmp == nullptr) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
+				if (needRealloc) {
+					if (bmpState->bmp) delete bmpState->bmp;
+					bmpState->bmp = new BasicBitmap(needW, needH, BasicBitmap::A8R8G8B8);
+					bmpState->imgW = needW;
+					bmpState->imgH = needH;
+				}
+				for (uint32_t row = 0; row < rh; ++row) {
+					if ((ry + row) >= (uint32_t)bmpState->imgH || rx >= (uint32_t)bmpState->imgW) continue;
+					uint8_t* dst = bmpState->bmp->Bits() + ((ry + row) * bmpState->imgW + rx) * 4;
+					uint8_t* src = tileBmp->Bits() + row * rw * 4;
+					memcpy(dst, src, rw * 4);
+				}
+				if (rx == 0 && ry == 0 && rw == (uint32_t)bmpState->imgW && rh == (uint32_t)bmpState->imgH) {
+					fullScreenInvalidation = true;
+				}
+				else {
+					RECT tileRect;
+					tileRect.left = rx;
+					tileRect.top = ry;
+					tileRect.right = rx + rw;
+					tileRect.bottom = ry + rh;
+					invalidateRects.push_back(tileRect);
+				}
+				LeaveCriticalSection(&bmpState->cs);
+
+				SRDPRINTF("ScreenRecvThread: painted tile #%zu at %u,%u size %u,%u\n", receivedDirty, rx, ry, rw, rh);
+
+				receivedDirty++;
+			}
+			SRDPRINTF("ScreenRecvThread: received %zu dirty tiles for %zu dirty bits\n", receivedDirty, dirtyCount);
+
+			if (fullScreenInvalidation) {
+				InvalidateRect(hwnd, NULL, FALSE);
+				SRDPRINTF("ScreenRecvThread: InvalidateRect(NULL)\n");
 			}
 			else {
-				RECT tileRect;
-				tileRect.left = rx;
-				tileRect.top = ry;
-				tileRect.right = rx + rw;
-				tileRect.bottom = ry + rh;
-				invalidateRects.push_back(tileRect);
+				for (const RECT& r : invalidateRects) {
+					InvalidateRect(hwnd, &r, FALSE);
+					SRDPRINTF("ScreenRecvThread: InvalidateRect(%ld,%ld,%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
+				}
 			}
-			LeaveCriticalSection(&bmpState->cs);
+			if (frame_error) {
+				SRDPRINTF("ScreenRecvThread: frame_error, breaking\n");
+				lost_connection = true;
+				break;
+			}
 
-			SRDPRINTF("ScreenRecvThread: painted tile #%zu at %u,%u size %u,%u\n", receivedDirty, rx, ry, rw, rh);
-
-			receivedDirty++;
-		}
-		SRDPRINTF("ScreenRecvThread: received %zu dirty tiles for %zu dirty bits\n", receivedDirty, dirtyCount);
-
-		if (fullScreenInvalidation) {
-			InvalidateRect(hwnd, NULL, FALSE);
-			SRDPRINTF("ScreenRecvThread: InvalidateRect(NULL)\n");
-		}
-		else {
-			for (const RECT& r : invalidateRects) {
-				InvalidateRect(hwnd, &r, FALSE);
-				SRDPRINTF("ScreenRecvThread: InvalidateRect(%ld,%ld,%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
+			framesLastSec++;
+			bytesLastSec += bytesThisFrame;
+			auto now = steady_clock::now();
+			if (duration_cast<seconds>(now - lastSec).count() >= 1) {
+				double mbps = (bytesLastSec * 8.0) / 1e6;
+				RECT clientRect;
+				GetClientRect(hwnd, &clientRect);
+				int winW = clientRect.right - clientRect.left;
+				int winH = clientRect.bottom - clientRect.top;
+				char title[256];
+				snprintf(title, sizeof(title), "Remote Screen | IP: %s | Port: %d | FPS: %d | Mbps: %.2f | Size: %dx%d",
+					last_ip.c_str(), last_port, framesLastSec, mbps, winW, winH);
+				PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
+				SRDPRINTF("ScreenRecvThread: Updated window title\n");
+				bytesLastSec = 0;
+				framesLastSec = 0;
+				lastSec = now;
 			}
 		}
-		if (frame_error) {
-			SRDPRINTF("ScreenRecvThread: frame_error, breaking\n");
-			break;
-		}
-		framesLastSec++;
-		bytesLastSec += bytesThisFrame;
-		auto now = steady_clock::now();
-		if (duration_cast<seconds>(now - lastSec).count() >= 1) {
-			double mbps = (bytesLastSec * 8.0) / 1e6;
-			RECT clientRect;
-			GetClientRect(hwnd, &clientRect);
-			int winW = clientRect.right - clientRect.left;
-			int winH = clientRect.bottom - clientRect.top;
-			char title[256];
-			snprintf(title, sizeof(title), "Remote Screen | IP: %s | FPS: %d | Mbps: %.2f | Size: %dx%d",
-				ip.c_str(), framesLastSec, mbps, winW, winH);
-			PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
-			SRDPRINTF("ScreenRecvThread: Updated window title\n");
-			bytesLastSec = 0;
-			framesLastSec = 0;
-			lastSec = now;
-		}
+
+		closesocket(skt);
+		skt = INVALID_SOCKET;
+		SetConnectionTitle(hwnd, last_ip, last_port, "Reconnecting...");
+		SRDPRINTF("ScreenRecvThread: lost connection, will try to reconnect...\n");
+		std::this_thread::sleep_for(std::chrono::seconds(2));
 	}
-	closesocket(skt);
-	SRDPRINTF("ScreenRecvThread: closesocket, exiting thread\n");
 }
 
 
@@ -1697,9 +1813,16 @@ void StartScreenRecv(std::string server_ip, int port) {
 
 	ShowWindow(hwnd, SW_SHOWNORMAL);
 
-	std::thread t(ScreenRecvThread, skt, hwnd, server_ip);
+	// Use actual connected socket to get the true server IP and port
+	std::pair<std::string, int> server_info = GetPeerIpAndPort(skt);
+	std::string actual_server_ip = server_info.first;
+	int actual_server_port = server_info.second;
+
+	// Launch the screen receive thread with correct info
+	std::thread t(ScreenRecvThread, skt, hwnd, actual_server_ip, actual_server_port);
 	t.detach();
 
+	// Standard window message loop
 	MSG msg = { 0 };
 	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
 		if (!IsDialogMessage(hwnd, &msg)) {
@@ -1708,8 +1831,12 @@ void StartScreenRecv(std::string server_ip, int port) {
 		}
 		if (!IsWindow(hwnd)) break;
 	}
-}
 
+	// Cleanup: close socket if needed
+	if (skt != INVALID_SOCKET) {
+		closesocket(skt);
+	}
+}
 LRESULT MainWindow::HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	switch (uMsg)
