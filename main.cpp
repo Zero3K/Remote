@@ -1640,7 +1640,7 @@ private:
 
 	} Server;
 
-	public:
+public:
 
 	struct ClientData
 	{
@@ -1725,6 +1725,10 @@ void SetRemoteScreenFps(HWND hwnd, int fps) {
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	// Retrieve per-window state
 	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+
+	std::cout << "[MSG] msg=0x" << std::hex << msg
+		<< " wParam=0x" << wParam
+		<< " lParam=0x" << lParam << std::dec << std::endl;
 
 	switch (msg) {
 	case WM_CREATE:
@@ -1834,18 +1838,52 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		break;
 	}
+					  // --- Replace your existing WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP handler in ScreenWndProc with this minimal patch ---
+					  // This ensures modifier combos (CTRL+ALT+KEY, ALT+KEY, etc) work remotely.
+
 	case WM_KEYDOWN:
-	case WM_KEYUP: {
+	case WM_KEYUP: 
+	case WM_SYSKEYDOWN: 
+	case WM_SYSKEYUP: {
 		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
 			INPUT input = {};
 			input.type = INPUT_KEYBOARD;
 			input.ki.wVk = (WORD)wParam;
-			input.ki.wScan = MapVirtualKeyA((UINT)wParam, MAPVK_VK_TO_VSC);
-			input.ki.dwFlags = (msg == WM_KEYUP) ? KEYEVENTF_KEYUP : 0;
+			input.ki.wScan = 0; // Let Windows fill this in if needed
+			input.ki.dwFlags = 0;
+			if (msg == WM_KEYUP)
+				input.ki.dwFlags |= KEYEVENTF_KEYUP;
+
+			// Set EXTENDEDKEY for extended keys (F10, arrows, navigation, etc.)
+			WORD vk = input.ki.wVk;
+			if (
+				(vk >= VK_F1 && vk <= VK_F24) ||
+				vk == VK_MENU || vk == VK_RMENU ||
+				vk == VK_CONTROL || vk == VK_RCONTROL ||
+				vk == VK_INSERT || vk == VK_DELETE ||
+				vk == VK_HOME || vk == VK_END ||
+				vk == VK_PRIOR || vk == VK_NEXT ||
+				vk == VK_LEFT || vk == VK_RIGHT ||
+				vk == VK_UP || vk == VK_DOWN ||
+				vk == VK_NUMLOCK || vk == VK_DIVIDE
+				) {
+				input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+			}
+			// Special: Numpad Enter is extended, main Enter is not. If you want to handle this, you need to check lParam.
+
+			// DEBUG LOGGING: Print what is being sent to the server
+			std::cout << "[CLIENT] Sending INPUT: "
+				<< "VK=0x" << std::hex << (int)input.ki.wVk
+				<< " Scan=0x" << std::hex << (int)input.ki.wScan
+				<< " Flags=0x" << std::hex << (int)input.ki.dwFlags
+				<< " (" << ((msg == WM_KEYDOWN) ? "DOWN" : "UP") << ")"
+				<< std::dec << std::endl;
+
 			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
 		}
 		break;
 	}
+
 
 	case WM_ERASEBKGND:
 		return 1; // Prevent flicker
@@ -2008,7 +2046,7 @@ void StartScreenRecv(std::string server_ip, int port) {
 	int w = g_pMainWindow ? g_pMainWindow->m_savedRemoteW : 900;
 	int h = g_pMainWindow ? g_pMainWindow->m_savedRemoteH : 600;
 
-    HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
+	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
 		left, top, w, h, NULL, NULL, wc.hInstance, NULL);
 
 	// Save HWND to main window if you want access later
@@ -2032,10 +2070,8 @@ void StartScreenRecv(std::string server_ip, int port) {
 	// Standard window message loop
 	MSG msg = { 0 };
 	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
-		if (!IsDialogMessage(hwnd, &msg)) {
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
 		if (!IsWindow(hwnd)) break;
 	}
 
@@ -2670,13 +2706,42 @@ void MainWindow::ConvertInput(PRAWINPUT pRaw, INPUT* pInput) {
 		pInput->ki.wVk = pRaw->data.keyboard.VKey;
 		pInput->ki.wScan = MapVirtualKeyA(pRaw->data.keyboard.VKey, MAPVK_VK_TO_VSC);
 		pInput->ki.dwFlags = KEYEVENTF_SCANCODE;
-		pInput->ki.time = 0;
+
+		// Set KEYUP if key up
 		if (pRaw->data.keyboard.Message == WM_KEYUP) {
-			pInput->ki.dwFlags = KEYEVENTF_KEYUP;
+			pInput->ki.dwFlags |= KEYEVENTF_KEYUP;
 		}
-		else if (pRaw->data.keyboard.Message == WM_KEYDOWN) {
-			pInput->ki.dwFlags = 0;
+
+		// Extended key logic
+		// Most navigation keys and F1-F24 are extended. Main Enter is NOT extended, but Numpad Enter is.
+		WORD vk = pInput->ki.wVk;
+		USHORT makeCode = pRaw->data.keyboard.MakeCode;
+		bool isExtended = (pRaw->data.keyboard.Flags & RI_KEY_E0) != 0;
+
+		// Set extended for the right keys
+		if (
+			(vk >= VK_F1 && vk <= VK_F24) ||
+			vk == VK_MENU || vk == VK_CONTROL ||
+			vk == VK_INSERT || vk == VK_DELETE ||
+			vk == VK_HOME || vk == VK_END ||
+			vk == VK_PRIOR || vk == VK_NEXT ||
+			vk == VK_LEFT || vk == VK_RIGHT ||
+			vk == VK_UP || vk == VK_DOWN ||
+			vk == VK_NUMLOCK || vk == VK_DIVIDE
+			) {
+			pInput->ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
 		}
+
+		// Special handling for Enter (Numpad vs Main)
+		// If the input is extended and Enter, it's Numpad Enter
+		if (vk == VK_RETURN && isExtended) {
+			pInput->ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+		}
+
+		// You can print for debugging:
+		printf("VK: %02X Scan: %02X Flags: %08X\n", vk, pInput->ki.wScan, pInput->ki.dwFlags);
+
+		pInput->ki.time = 0;
 	}
 }
 
@@ -2777,8 +2842,8 @@ int MainWindow::ServerStart()
 }
 
 int MainWindow::ServerTerminate()
-{		
-    if (Server.isOnline)
+{
+	if (Server.isOnline)
 	{
 		int error = 1;
 		Log("Terminate");
@@ -2809,7 +2874,7 @@ int MainWindow::ServerTerminate()
 }
 
 int MainWindow::ClientConnect()
-  {
+{
 	char out_ip[50];
 	char out_port[50];
 	int error = 1;
@@ -2825,32 +2890,32 @@ int MainWindow::ClientConnect()
 	if (error == 1) {
 		Log("Couldn't connect");
 		//MessageBox(NULL, "couldn't connect", "Remote", MB_OK);
-		}
+	}
 	else {
 		Log("Connected!");
 		Client.isConnected = true;
 		UpdateGuiControls();
-		
+
 		//start receive thread that will receive data
 		Log("Starting receive thread");
 		Client.tRecv = std::thread(&MainWindow::ReceiveThread, this);
-		
+
 		// start send input thread that sends the received input
 		Log("Starting input thread");
 		Client.tSendInput = std::thread(&MainWindow::OutputThread, this);
-		
+
 		Client.tSendInput.detach();
 		Client.tRecv.detach();
 		// SCREEN STREAM: Start a new window to receive the screen stream
 		std::thread([ip = Client.ip](){
-		StartScreenRecv(ip, SCREEN_STREAM_PORT);
+			StartScreenRecv(ip, SCREEN_STREAM_PORT);
 		}).detach();
 		Log("Screen streaming client started");
-		}
-	return 0;
 	}
+	return 0;
+}
 int MainWindow::ClientDisconnect()
-   {
+{
 	Log("Disconnect");
 	CloseConnection(&Client.sktServer);
 	//MessageBox(m_hwnd, "Disconnect", "Remote", MB_OK);
@@ -2870,53 +2935,53 @@ int MainWindow::ClientDisconnect()
 }
 
 int MainWindow::ListenThread()
- {
+{
 	bool socket_found = false;
 	int index = 0;
 	while (Server.isOnline && Data.nMode == MODE::SERVER)
-		 {
+	{
 		std::unique_lock<std::mutex> lock(Server.mu_sktclient);
 		if (Server.nConnected >= Server.maxClients)
-			 {
+		{
 			Server.cond_listen.wait(lock);
-			}
+		}
 		if (!socket_found) {
 			for (int i = 0; i < Server.ClientsInformation.size(); i++)
-				{
+			{
 				if (Server.ClientsInformation[i].socket == INVALID_SOCKET)
-					 {
+				{
 					socket_found = true;
 					index = i;
-					}
-				 }
+				}
 			}
+		}
 		lock.unlock();
 		if (listen(Server.sktListen, 1) == SOCKET_ERROR) {
 			Log("Listen failed with error: " + std::to_string(WSAGetLastError()));
-			}
-		sockaddr * inc_conn = new sockaddr;
+		}
+		sockaddr* inc_conn = new sockaddr;
 		int sosize = sizeof(sockaddr);
 		Server.ClientsInformation[index].socket = accept(Server.sktListen, inc_conn, &sosize);
 		if (Server.ClientsInformation[index].socket == INVALID_SOCKET)
-			{
+		{
 			Log("accept failed: " + std::to_string(WSAGetLastError()));
-			}
+		}
 		else
-			{
+		{
 			Log("Connection accepted");
 			Server.nConnected++;
-            // Start input receive/inject thread per client
+			// Start input receive/inject thread per client
 			std::thread(ServerInputRecvThread, Server.ClientsInformation[index].socket).detach();
 			socket_found = false;
-			}
-		 delete inc_conn;
-		 }
+		}
+		delete inc_conn;
+	}
 	Log("Listen thread - ended");
 	return 0;
-	}
+}
 
 // Removed SendThread logic (no longer needed on server)
- 
+
 // --- Add server-side input receiving and injection thread ---
 
 // New function: receive INPUT structs from each client and inject locally
@@ -2949,7 +3014,19 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 		}
 
 		if (received == sizeof(INPUT)) {
-			SendInput(1, (INPUT*)buffer, sizeof(INPUT));
+			INPUT* inp = (INPUT*)buffer;
+			// DEBUG LOGGING: Print what is being injected
+			if (inp->type == INPUT_KEYBOARD) {
+				std::cout << "[SERVER] Injecting INPUT: "
+					<< "VK=0x" << std::hex << (int)inp->ki.wVk
+					<< " Scan=0x" << std::hex << (int)inp->ki.wScan
+					<< " Flags=0x" << std::hex << (int)inp->ki.dwFlags
+					<< " ("
+					<< ((inp->ki.dwFlags & KEYEVENTF_KEYUP) ? "UP" : "DOWN")
+					<< ")"
+					<< std::dec << std::endl;
+			}
+			SendInput(1, inp, sizeof(INPUT));
 		}
 	}
 	closesocket(clientSocket);
@@ -2977,9 +3054,9 @@ int MainWindow::ReceiveThread()
 	}
 	return 0;
 }
-	 int MainWindow::OutputThread()
+int MainWindow::OutputThread()
 {
-		 while (Client.isConnected && Data.nMode == MODE::CLIENT)
+	while (Client.isConnected && Data.nMode == MODE::CLIENT)
 	{
 		std::unique_lock<std::mutex> lock(Client.mu_input);
 		if (Client.inputQueue.empty())
@@ -3011,296 +3088,296 @@ int MainWindow::ReceiveThread()
 }
 
 
-	 // --- SaveConfig: now saves FPS, AlwaysOnTop, and window size ---
-	 bool MainWindow::SaveConfig()
-	 {
-		 std::fstream f(configName, std::fstream::out | std::fstream::trunc);
-		 if (!f.is_open())
-		 {
-			 std::cout << "can't save" << std::endl;
-			 return false;
-		 }
-		 f << "port " << sPort << std::endl;
-		 f << "server_ip " << Client.ip << std::endl;
-		 f << "max_clients " << Server.maxClients << std::endl;
-		 f << "fps " << g_streamingFps.load() << std::endl;
-		 f << "always_on_top " << (g_alwaysOnTop ? 1 : 0) << std::endl;
-		 f << "remote_rect " << m_savedRemoteLeft << " " << m_savedRemoteTop << " "
-		   << m_savedRemoteW << " " << m_savedRemoteH << "\n";
+// --- SaveConfig: now saves FPS, AlwaysOnTop, and window size ---
+bool MainWindow::SaveConfig()
+{
+	std::fstream f(configName, std::fstream::out | std::fstream::trunc);
+	if (!f.is_open())
+	{
+		std::cout << "can't save" << std::endl;
+		return false;
+	}
+	f << "port " << sPort << std::endl;
+	f << "server_ip " << Client.ip << std::endl;
+	f << "max_clients " << Server.maxClients << std::endl;
+	f << "fps " << g_streamingFps.load() << std::endl;
+	f << "always_on_top " << (g_alwaysOnTop ? 1 : 0) << std::endl;
+	f << "remote_rect " << m_savedRemoteLeft << " " << m_savedRemoteTop << " "
+		<< m_savedRemoteW << " " << m_savedRemoteH << "\n";
 
-		 WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
-		 if (m_hwnd && GetWindowPlacement(m_hwnd, &wp) && wp.showCmd == SW_SHOWNORMAL) {
-			 RECT& r = wp.rcNormalPosition;
-			 f << "window_rect " << r.left << " " << r.top << " "
-				 << (r.right - r.left) << " " << (r.bottom - r.top) << std::endl;
-		 }
-		 else {
-			 // fallback to last saved
-			 f << "window_rect " << m_savedWinLeft << " " << m_savedWinTop << " " << m_savedWinW << " " << m_savedWinH << std::endl;
-		 }
-		 f.close();
-		 return true;
-	 }
+	WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+	if (m_hwnd && GetWindowPlacement(m_hwnd, &wp) && wp.showCmd == SW_SHOWNORMAL) {
+		RECT& r = wp.rcNormalPosition;
+		f << "window_rect " << r.left << " " << r.top << " "
+			<< (r.right - r.left) << " " << (r.bottom - r.top) << std::endl;
+	}
+	else {
+		// fallback to last saved
+		f << "window_rect " << m_savedWinLeft << " " << m_savedWinTop << " " << m_savedWinW << " " << m_savedWinH << std::endl;
+	}
+	f.close();
+	return true;
+}
 
 
-	 // --- LoadConfig: now loads FPS, AlwaysOnTop, and window size ---
-	 bool MainWindow::LoadConfig()
-	 {
-		 sPort = std::to_string(DEFAULT_PORT);
-		 iPort = std::stoi(sPort);
-		 Server.maxClients = MAX_CLIENTS;
-		 m_savedFps = SCREEN_STREAM_FPS;
-		 m_savedAlwaysOnTop = false;
-		 m_savedWinLeft = 100;
-		 m_savedWinTop = 100;
-		 m_savedWinW = 477;
-		 m_savedWinH = 340;
-		 m_savedRemoteLeft = 100;
-		 m_savedRemoteTop = 100;
-		 m_savedRemoteW = 900;
-		 m_savedRemoteH = 600;
+// --- LoadConfig: now loads FPS, AlwaysOnTop, and window size ---
+bool MainWindow::LoadConfig()
+{
+	sPort = std::to_string(DEFAULT_PORT);
+	iPort = std::stoi(sPort);
+	Server.maxClients = MAX_CLIENTS;
+	m_savedFps = SCREEN_STREAM_FPS;
+	m_savedAlwaysOnTop = false;
+	m_savedWinLeft = 100;
+	m_savedWinTop = 100;
+	m_savedWinW = 477;
+	m_savedWinH = 340;
+	m_savedRemoteLeft = 100;
+	m_savedRemoteTop = 100;
+	m_savedRemoteW = 900;
+	m_savedRemoteH = 600;
 
-		 std::fstream f(configName, std::fstream::in);
-		 if (!f.is_open())
-		 {
-			 return false;
-		 }
+	std::fstream f(configName, std::fstream::in);
+	if (!f.is_open())
+	{
+		return false;
+	}
 
-		 std::string line;
-		 std::string param;
-		 std::stringstream s;
+	std::string line;
+	std::string param;
+	std::stringstream s;
 
-		 while (std::getline(f, line))
-		 {
-			 s.clear();
-			 s.str(line);
-			 s >> param;
-			 if (param == "port") {
-				 s >> sPort;
-			 }
-			 else if (param == "server_ip") {
-				 s >> Client.ip;
-			 }
-			 else if (param == "max_clients") {
-				 std::string max;
-				 s >> max;
-				 Server.maxClients = std::stoi(max);
-			 }
-			 else if (param == "fps") {
-				 int fps;
-				 s >> fps;
-				 if (fps >= 5 && fps <= 60) {
-					 m_savedFps = fps;
-					 g_streamingFps = fps;
-					 g_screenStreamMenuFps = fps;
-					 g_screenStreamActualFps = fps;
-				 }
-			 }
-			 else if (param == "always_on_top") {
-				 int atop = 0;
-				 s >> atop;
-				 m_savedAlwaysOnTop = (atop != 0);
-				 g_alwaysOnTop = m_savedAlwaysOnTop;
-			 }
-			 else if (param == "window_rect") {
-				 int l, t, w, h;
-				 s >> l >> t >> w >> h;
-				 if (w > 100 && h > 100) {
-					 m_savedWinLeft = l;
-					 m_savedWinTop = t;
-					 m_savedWinW = w;
-					 m_savedWinH = h;
-				 }
-			 }
-			 else if (param == "remote_rect") {
-				 int l, t, w, h;
-				 s >> l >> t >> w >> h;
-				 if (w > 100 && h > 100) {
-					 m_savedRemoteLeft = l;
-					 m_savedRemoteTop = t;
-					 m_savedRemoteW = w;
-					 m_savedRemoteH = h;
-				 }
-			 }
-		 }
+	while (std::getline(f, line))
+	{
+		s.clear();
+		s.str(line);
+		s >> param;
+		if (param == "port") {
+			s >> sPort;
+		}
+		else if (param == "server_ip") {
+			s >> Client.ip;
+		}
+		else if (param == "max_clients") {
+			std::string max;
+			s >> max;
+			Server.maxClients = std::stoi(max);
+		}
+		else if (param == "fps") {
+			int fps;
+			s >> fps;
+			if (fps >= 5 && fps <= 60) {
+				m_savedFps = fps;
+				g_streamingFps = fps;
+				g_screenStreamMenuFps = fps;
+				g_screenStreamActualFps = fps;
+			}
+		}
+		else if (param == "always_on_top") {
+			int atop = 0;
+			s >> atop;
+			m_savedAlwaysOnTop = (atop != 0);
+			g_alwaysOnTop = m_savedAlwaysOnTop;
+		}
+		else if (param == "window_rect") {
+			int l, t, w, h;
+			s >> l >> t >> w >> h;
+			if (w > 100 && h > 100) {
+				m_savedWinLeft = l;
+				m_savedWinTop = t;
+				m_savedWinW = w;
+				m_savedWinH = h;
+			}
+		}
+		else if (param == "remote_rect") {
+			int l, t, w, h;
+			s >> l >> t >> w >> h;
+			if (w > 100 && h > 100) {
+				m_savedRemoteLeft = l;
+				m_savedRemoteTop = t;
+				m_savedRemoteW = w;
+				m_savedRemoteH = h;
+			}
+		}
+	}
 
-		 std::cout << "Config Loaded:\n"
-			 << "    port = " << sPort << '\n'
-			 << "    server ip = " << Client.ip << '\n'
-			 << "    max number clients = " << Server.maxClients << std::endl
-			 << "    fps = " << m_savedFps << std::endl
-			 << "    always_on_top = " << (m_savedAlwaysOnTop ? "true" : "false") << std::endl
-			 << "    window rect = (" << m_savedWinLeft << "," << m_savedWinTop << ") "
-			 << m_savedWinW << "x" << m_savedWinH << std::endl
-			 << "    remote rect = (" << m_savedRemoteLeft << "," << m_savedRemoteTop << ") "
-			 << m_savedRemoteW << "x" << m_savedRemoteH << std::endl;
+	std::cout << "Config Loaded:\n"
+		<< "    port = " << sPort << '\n'
+		<< "    server ip = " << Client.ip << '\n'
+		<< "    max number clients = " << Server.maxClients << std::endl
+		<< "    fps = " << m_savedFps << std::endl
+		<< "    always_on_top = " << (m_savedAlwaysOnTop ? "true" : "false") << std::endl
+		<< "    window rect = (" << m_savedWinLeft << "," << m_savedWinTop << ") "
+		<< m_savedWinW << "x" << m_savedWinH << std::endl
+		<< "    remote rect = (" << m_savedRemoteLeft << "," << m_savedRemoteTop << ") "
+		<< m_savedRemoteW << "x" << m_savedRemoteH << std::endl;
 
-		 f.close();
-		 return true;
-	 }
+	f.close();
+	return true;
+}
 
-	 // Helper for command line parsing
-	 std::string GetCmdOption(const std::vector<std::string>& args, const std::string& option) {
-		 auto it = std::find(args.begin(), args.end(), option);
-		 if (it != args.end() && ++it != args.end())
-			 return *it;
-		 return "";
-	 }
-	 bool CmdOptionExists(const std::vector<std::string>& args, const std::string& option) {
-		 return std::find(args.begin(), args.end(), option) != args.end();
-	 }
+// Helper for command line parsing
+std::string GetCmdOption(const std::vector<std::string>& args, const std::string& option) {
+	auto it = std::find(args.begin(), args.end(), option);
+	if (it != args.end() && ++it != args.end())
+		return *it;
+	return "";
+}
+bool CmdOptionExists(const std::vector<std::string>& args, const std::string& option) {
+	return std::find(args.begin(), args.end(), option) != args.end();
+}
 
-	 void PrintUsage(const char* exeName) {
-		 std::cout << "Usage:\n";
-		 std::cout << "  " << exeName << " --server [--port PORT]\n";
-		 std::cout << "  " << exeName << " --client --ip IP_ADDRESS --port PORT\n";
-		 std::cout << "Examples:\n";
-		 std::cout << "  " << exeName << " --server\n";
-		 std::cout << "  " << exeName << " --server --port 5555\n";
-		 std::cout << "  " << exeName << " --client --ip 127.0.0.1 --port 27015\n";
-	 }
+void PrintUsage(const char* exeName) {
+	std::cout << "Usage:\n";
+	std::cout << "  " << exeName << " --server [--port PORT]\n";
+	std::cout << "  " << exeName << " --client --ip IP_ADDRESS --port PORT\n";
+	std::cout << "Examples:\n";
+	std::cout << "  " << exeName << " --server\n";
+	std::cout << "  " << exeName << " --server --port 5555\n";
+	std::cout << "  " << exeName << " --client --ip 127.0.0.1 --port 27015\n";
+}
 
-	 // Minimal server loop for screen streaming
-	 void RunHeadlessServer(int port) {
-		 std::cout << "Starting headless server on port " << port << std::endl;
-		 SOCKET sktListen = INVALID_SOCKET;
-		 if (InitializeServer(sktListen, port) != 0) {
-			 std::cerr << "Failed to initialize server!" << std::endl;
-			 return;
-		 }
-		 std::cout << "Server listening for input connections on port " << port << std::endl;
-		 // Accept and discard input connections in a loop (you may want to expand this)
-		 while (true) {
-			 if (listen(sktListen, 1) == SOCKET_ERROR) break;
-			 sockaddr_in client_addr;
-			 int addrlen = sizeof(client_addr);
-			 SOCKET sktClient = accept(sktListen, (sockaddr*)&client_addr, &addrlen);
-			 if (sktClient == INVALID_SOCKET) continue;
-			 std::thread(ScreenStreamServerThread, sktClient).detach();
-		 }
-		 closesocket(sktListen);
-	 }
+// Minimal server loop for screen streaming
+void RunHeadlessServer(int port) {
+	std::cout << "Starting headless server on port " << port << std::endl;
+	SOCKET sktListen = INVALID_SOCKET;
+	if (InitializeServer(sktListen, port) != 0) {
+		std::cerr << "Failed to initialize server!" << std::endl;
+		return;
+	}
+	std::cout << "Server listening for input connections on port " << port << std::endl;
+	// Accept and discard input connections in a loop (you may want to expand this)
+	while (true) {
+		if (listen(sktListen, 1) == SOCKET_ERROR) break;
+		sockaddr_in client_addr;
+		int addrlen = sizeof(client_addr);
+		SOCKET sktClient = accept(sktListen, (sockaddr*)&client_addr, &addrlen);
+		if (sktClient == INVALID_SOCKET) continue;
+		std::thread(ScreenStreamServerThread, sktClient).detach();
+	}
+	closesocket(sktListen);
+}
 
-	 // Minimal client launcher to receive the screen (no UI)
-	 void RunHeadlessClient(const std::string& ip, int port) {
-		 std::cout << "Starting headless client, connecting to " << ip << ":" << port << std::endl;
-		 StartScreenRecv(ip, port);
-	 }
+// Minimal client launcher to receive the screen (no UI)
+void RunHeadlessClient(const std::string& ip, int port) {
+	std::cout << "Starting headless client, connecting to " << ip << ":" << port << std::endl;
+	StartScreenRecv(ip, port);
+}
 
-	 int main(int argc, char* argv[])
-	 {
-		 // ---- Ensure WSAStartup is called ONCE here ----
-		 WSADATA wsadata;
-		 int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
-		 if (wsaResult != 0) {
-			 std::cout << "WSAStartup failed: " << wsaResult << std::endl;
-			 return 1;
-		 }
+int main(int argc, char* argv[])
+{
+	// ---- Ensure WSAStartup is called ONCE here ----
+	WSADATA wsadata;
+	int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsadata);
+	if (wsaResult != 0) {
+		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
+		return 1;
+	}
 
-		 // --- Command line mode check ---
-		 std::vector<std::string> args(argv + 1, argv + argc);
-		 bool isServer = CmdOptionExists(args, "--server");
-		 bool isClient = CmdOptionExists(args, "--client");
+	// --- Command line mode check ---
+	std::vector<std::string> args(argv + 1, argv + argc);
+	bool isServer = CmdOptionExists(args, "--server");
+	bool isClient = CmdOptionExists(args, "--client");
 
-		 MainWindow win;
-		 g_pMainWindow = &win; // <-- Set the global pointer after win is defined
+	MainWindow win;
+	g_pMainWindow = &win; // <-- Set the global pointer after win is defined
 
-		 // Use loaded size from config
-		 int winW = win.m_savedWinW;
-		 int winH = win.m_savedWinH;
-		 if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL))
-		 {
-			 std::cout << "error creating the main window: " << GetLastError() << std::endl;
-			 WSACleanup();
-			 return 0;
-		 }
+	// Use loaded size from config
+	int winW = win.m_savedWinW;
+	int winH = win.m_savedWinH;
+	if (!win.Create(nullptr, "Remote", WS_OVERLAPPEDWINDOW, 0, CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL))
+	{
+		std::cout << "error creating the main window: " << GetLastError() << std::endl;
+		WSACleanup();
+		return 0;
+	}
 
-		 // Set Always On Top on restore
-		 if (win.m_savedAlwaysOnTop) {
-			 SetWindowPos(win.Window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-		 }
+	// Set Always On Top on restore
+	if (win.m_savedAlwaysOnTop) {
+		SetWindowPos(win.Window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+	}
 
-		 // --- Clipboard sync: initialize clipboard monitoring as soon as window is created ---
-		 // By default, don't set socket yet (set it after connect in client/server logic).
-		 InitClipboardMonitor(win.Window(), INVALID_SOCKET);
+	// --- Clipboard sync: initialize clipboard monitoring as soon as window is created ---
+	// By default, don't set socket yet (set it after connect in client/server logic).
+	InitClipboardMonitor(win.Window(), INVALID_SOCKET);
 
-		 // --- Command-line reflection logic for GUI ---
-		 if (!args.empty()) {
-			 if ((isServer && isClient) || (!isServer && !isClient)) {
-				 PrintUsage(argv[0]);
-				 WSACleanup();
-				 return 1;
-			 }
+	// --- Command-line reflection logic for GUI ---
+	if (!args.empty()) {
+		if ((isServer && isClient) || (!isServer && !isClient)) {
+			PrintUsage(argv[0]);
+			WSACleanup();
+			return 1;
+		}
 
-			 if (isServer) {
-				 int port = DEFAULT_PORT;
-				 std::string portStr = GetCmdOption(args, "--port");
-				 if (!portStr.empty()) {
-					 try { port = std::stoi(portStr); }
-					 catch (...) {
-						 std::cerr << "Invalid port: " << portStr << std::endl;
-						 WSACleanup();
-						 return 1;
-					 }
-				 }
-				 win.sPort = std::to_string(port); // sPort should be made public
-				 SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
-				 win.SetMode(MainWindow::MODE::SERVER);
+		if (isServer) {
+			int port = DEFAULT_PORT;
+			std::string portStr = GetCmdOption(args, "--port");
+			if (!portStr.empty()) {
+				try { port = std::stoi(portStr); }
+				catch (...) {
+					std::cerr << "Invalid port: " << portStr << std::endl;
+					WSACleanup();
+					return 1;
+				}
+			}
+			win.sPort = std::to_string(port); // sPort should be made public
+			SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
+			win.SetMode(MainWindow::MODE::SERVER);
 
-				 // Ensure radio buttons reflect the mode
-				 SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_CHECKED, 0);
-				 SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
+			// Ensure radio buttons reflect the mode
+			SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_CHECKED, 0);
+			SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
 
-				 PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_START, BN_CLICKED), 0);
-			 }
-			 else if (isClient) {
-				 std::string ip = GetCmdOption(args, "--ip");
-				 std::string portStr = GetCmdOption(args, "--port");
-				 int port = DEFAULT_PORT;
-				 if (ip.empty() || portStr.empty()) {
-					 PrintUsage(argv[0]);
-					 WSACleanup();
-					 return 1;
-				 }
-				 try { port = std::stoi(portStr); }
-				 catch (...) {
-					 std::cerr << "Invalid port: " << portStr << std::endl;
-					 WSACleanup();
-					 return 1;
-				 }
-				 win.Client.ip = ip;
-				 SetWindowTextA(win.m_itxtIP.Window(), ip.c_str());
-				 win.sPort = std::to_string(port); // sPort should be made public
-				 SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
-				 win.SetMode(MainWindow::MODE::CLIENT);
+			PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_START, BN_CLICKED), 0);
+		}
+		else if (isClient) {
+			std::string ip = GetCmdOption(args, "--ip");
+			std::string portStr = GetCmdOption(args, "--port");
+			int port = DEFAULT_PORT;
+			if (ip.empty() || portStr.empty()) {
+				PrintUsage(argv[0]);
+				WSACleanup();
+				return 1;
+			}
+			try { port = std::stoi(portStr); }
+			catch (...) {
+				std::cerr << "Invalid port: " << portStr << std::endl;
+				WSACleanup();
+				return 1;
+			}
+			win.Client.ip = ip;
+			SetWindowTextA(win.m_itxtIP.Window(), ip.c_str());
+			win.sPort = std::to_string(port); // sPort should be made public
+			SetWindowTextA(win.m_itxtPort.Window(), win.sPort.c_str());
+			win.SetMode(MainWindow::MODE::CLIENT);
 
-				 // Ensure radio buttons reflect the mode
-				 SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_CHECKED, 0);
-				 SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
+			// Ensure radio buttons reflect the mode
+			SendMessage(win.m_btnModeClient.Window(), BM_SETCHECK, BST_CHECKED, 0);
+			SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
 
-				 PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_CONNECT, BN_CLICKED), 0);
-			 }
-		 }
-		 // Use loaded position and size from config
-		 WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
-		 wp.showCmd = SW_SHOWNORMAL;
-		 wp.rcNormalPosition.left = win.m_savedWinLeft;
-		 wp.rcNormalPosition.top = win.m_savedWinTop;
-		 wp.rcNormalPosition.right = win.m_savedWinLeft + win.m_savedWinW;
-		 wp.rcNormalPosition.bottom = win.m_savedWinTop + win.m_savedWinH;
-		 SetWindowPlacement(win.Window(), &wp);
+			PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_CONNECT, BN_CLICKED), 0);
+		}
+	}
+	// Use loaded position and size from config
+	WINDOWPLACEMENT wp = { sizeof(WINDOWPLACEMENT) };
+	wp.showCmd = SW_SHOWNORMAL;
+	wp.rcNormalPosition.left = win.m_savedWinLeft;
+	wp.rcNormalPosition.top = win.m_savedWinTop;
+	wp.rcNormalPosition.right = win.m_savedWinLeft + win.m_savedWinW;
+	wp.rcNormalPosition.bottom = win.m_savedWinTop + win.m_savedWinH;
+	SetWindowPlacement(win.Window(), &wp);
 
-		 ShowWindow(win.Window(), 1);
+	ShowWindow(win.Window(), 1);
 
-		 MSG msg = { };
-		 while (GetMessage(&msg, NULL, 0, 0))
-		 {
-			 TranslateMessage(&msg);
-			 DispatchMessage(&msg);
-		 }
+	MSG msg = { };
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
 
-		 CleanupClipboardMonitor(win.Window());
+	CleanupClipboardMonitor(win.Window());
 
-		 WSACleanup();
-		 return 0;
-	 }
+	WSACleanup();
+	return 0;
+}
