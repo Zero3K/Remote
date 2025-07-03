@@ -1,7 +1,0 @@
-port 27015
-server_ip 26.32.1.4
-max_clients 10
-fps 20
-always_on_top 0
-remote_rect 100 100 900 600
-window_rect 100 100 477 340
