@@ -35,6 +35,16 @@
 #include <algorithm> // DIRTY TILE
 #pragma comment(lib, "Ws2_32.lib")
 
+int recvn(SOCKET s, char* buf, int len) {
+	int received = 0;
+	while (received < len) {
+		int ret = recv(s, buf + received, len - received, 0);
+		if (ret <= 0) return ret; // error or disconnect
+		received += ret;
+	}
+	return received;
+}
+
 // === CLIPBOARD PROTOCOL ===
 enum class MsgType : uint8_t {
 	Input = 0,
@@ -668,36 +678,18 @@ int ConnectScreenStreamServer(SOCKET& sktConn, std::string serverAdd, int port) 
 }
 
 int ReceiveServer(SOCKET sktConn, INPUT& data) {
-	INPUT* buff = new INPUT;
-	//std::cout << "receiving..." << std::endl;
-	int iResult = recv(sktConn, (char*)buff, sizeof(INPUT), 0);
-	if (iResult == sizeof(INPUT))
-	{
-		//std::cout << "Bytes received: " << iResult << std::endl;
-	}
-	else if (iResult == 0) {
-		std::cout << "Connection closed" << std::endl;
-		delete buff;
-		return 1;
-	}
-	else if (iResult < sizeof(INPUT))
-	{
-		int bytes_rec = iResult;
-		//int count = 0;
-		while (bytes_rec < sizeof(INPUT))
-		{
-			//std::cout << "Received partial input: " << count << " - " << bytes_rec << " bytes of " << sizeof(INPUT) << std::endl;
-			bytes_rec += recv(sktConn, (char*)buff + bytes_rec, sizeof(INPUT) - bytes_rec, 0);
-			//count++;
+	INPUT buff;
+	int iResult = recvn(sktConn, (char*)&buff, sizeof(INPUT));
+	if (iResult != sizeof(INPUT)) {
+		if (iResult == 0) {
+			std::cout << "Connection closed" << std::endl;
 		}
-	}
-	else {
-		std::cout << "Receive failed with error: " << WSAGetLastError() << std::endl;
-		delete buff;
+		else {
+			std::cout << "Receive failed with error: " << WSAGetLastError() << std::endl;
+		}
 		return 1;
 	}
-	data = *buff;
-	delete buff;
+	data = buff;
 	return 0;
 }
 int CloseConnection(SOCKET* sktConn) {
@@ -724,7 +716,7 @@ int CloseConnection(SOCKET* sktConn) {
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
 
-	// --- Clipboard protocol structures (should match recv side) ---
+	// --- Clipboard protocol structures (should match recvn side) ---
 	enum class MsgType : uint8_t {
 		Input = 0,
 		RemoteCtrl = 1,
@@ -776,21 +768,15 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		int peeked = recv(sktClient, cbuf, sizeof(ClipboardMsg), MSG_PEEK);
 		if (peeked >= (int)sizeof(ClipboardMsg)) {
 			ClipboardMsg* cmsg = (ClipboardMsg*)cbuf;
-			if (cmsg->type == MsgType::Clipboard && peeked >= int(sizeof(ClipboardMsg) + cmsg->length)) {
-				// Now receive the full message
-				int to_recv = sizeof(ClipboardMsg) + cmsg->length;
-				int recvd = 0;
-				std::vector<char> msgbuf(to_recv);
-				while (recvd < to_recv) {
-					int g = recv(sktClient, msgbuf.data() + recvd, to_recv - recvd, 0);
-					if (g <= 0) break;
-					recvd += g;
-				}
-				if (recvd == to_recv) {
+			int total_len = int(sizeof(ClipboardMsg) + cmsg->length);
+			if (cmsg->type == MsgType::Clipboard && peeked >= total_len) {
+				// Now receive the full message using recvn
+				std::vector<char> msgbuf(total_len);
+				int recvd = recvn(sktClient, msgbuf.data(), total_len);
+				if (recvd == total_len) {
 					std::string utf8(msgbuf.data() + sizeof(ClipboardMsg), cmsg->length);
 					ApplyRemoteClipboard(utf8);
 				}
-				// Processed clipboard, return true
 				u_long block = 0;
 				ioctlsocket(sktClient, FIONBIO, &block);
 				return true;
@@ -1097,17 +1083,15 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 
 		// --- RECEIVE WIDTH/HEIGHT FROM SERVER ---
 		uint32_t widthNet = 0, heightNet = 0;
-		int got = recv(skt, (char*)&widthNet, 4, MSG_WAITALL);
-		if (got != 4) {
-			SRDPRINTF("ScreenRecvThread: recv for width failed, got=%d\n", got);
+		if (recvn(skt, (char*)&widthNet, 4) != 4) {
+			SRDPRINTF("ScreenRecvThread: recvn for width failed\n");
 			closesocket(skt);
 			skt = INVALID_SOCKET;
 			std::this_thread::sleep_for(std::chrono::seconds(2));
 			continue;
 		}
-		got = recv(skt, (char*)&heightNet, 4, MSG_WAITALL);
-		if (got != 4) {
-			SRDPRINTF("ScreenRecvThread: recv for height failed, got=%d\n", got);
+		if (recvn(skt, (char*)&heightNet, 4) != 4) {
+			SRDPRINTF("ScreenRecvThread: recvn for height failed\n");
 			closesocket(skt);
 			skt = INVALID_SOCKET;
 			std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -1149,20 +1133,16 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				int peeked = recv(skt, cbuf, sizeof(ClipboardMsg), MSG_PEEK);
 				if (peeked >= (int)sizeof(ClipboardMsg)) {
 					ClipboardMsg* cmsg = (ClipboardMsg*)cbuf;
-					if (cmsg->type == MsgType::Clipboard && peeked >= int(sizeof(ClipboardMsg) + cmsg->length)) {
-						// Now receive the full message
-						int to_recv = sizeof(ClipboardMsg) + cmsg->length;
-						int recvd = 0;
-						std::vector<char> msgbuf(to_recv);
-						while (recvd < to_recv) {
-							int g = recv(skt, msgbuf.data() + recvd, to_recv - recvd, 0);
-							if (g <= 0) break;
-							recvd += g;
-						}
-						if (recvd == to_recv) {
+					int total_len = int(sizeof(ClipboardMsg) + cmsg->length);
+					if (cmsg->type == MsgType::Clipboard && peeked >= total_len) {
+						std::vector<char> msgbuf(total_len);
+						int recvd = recvn(skt, msgbuf.data(), total_len);
+						if (recvd == total_len) {
 							std::string utf8(msgbuf.data() + sizeof(ClipboardMsg), cmsg->length);
 							ApplyRemoteClipboard(utf8);
 						}
+						u_long block = 0;
+						ioctlsocket(skt, FIONBIO, &block);
 						continue;
 					}
 				}
@@ -1178,9 +1158,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 
 			// ... the rest of your original streaming loop is unchanged ...
 			uint32_t xrleBitmaskLenNet = 0;
-			int ret = recv(skt, (char*)&xrleBitmaskLenNet, 4, MSG_WAITALL);
-			if (ret != 4) {
-				SRDPRINTF("ScreenRecvThread: recv for bitmask length failed, ret=%d\n", ret);
+			if (recvn(skt, (char*)&xrleBitmaskLenNet, 4) != 4) {
+				SRDPRINTF("ScreenRecvThread: recvn for bitmask length failed\n");
 				lost_connection = true;
 				break;
 			}
@@ -1194,19 +1173,10 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			}
 
 			std::vector<uint8_t> xrleBitmask(xrleBitmaskLen);
-			size_t offset = 0;
-			while (offset < xrleBitmaskLen) {
-				int got = recv(skt, (char*)(xrleBitmask.data() + offset), xrleBitmaskLen - offset, 0);
-				if (got <= 0) {
-					SRDPRINTF("ScreenRecvThread: recv for xrleBitmask data failed, got=%d offset=%zu\n", got, offset);
-					lost_connection = true;
-					running = false;
-					break;
-				}
-				offset += got;
-			}
-			if (!running || lost_connection) {
-				SRDPRINTF("ScreenRecvThread: !running after xrleBitmask\n");
+			if (recvn(skt, (char*)xrleBitmask.data(), xrleBitmaskLen) != xrleBitmaskLen) {
+				SRDPRINTF("ScreenRecvThread: recvn for xrleBitmask data failed\n");
+				lost_connection = true;
+				running = false;
 				break;
 			}
 
@@ -1249,9 +1219,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			SRDPRINTF("\nScreenRecvThread: dirtyCount=%zu\n", dirtyCount);
 
 			uint32_t nTilesNet = 0;
-			ret = recv(skt, (char*)&nTilesNet, 4, MSG_WAITALL);
-			if (ret != 4) {
-				SRDPRINTF("ScreenRecvThread: recv for nTiles failed, ret=%d\n", ret);
+			if (recvn(skt, (char*)&nTilesNet, 4) != 4) {
+				SRDPRINTF("ScreenRecvThread: recvn for nTiles failed\n");
 				lost_connection = true;
 				break;
 			}
@@ -1278,13 +1247,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 					receivedDirty, tx, ty, x, y, w, h);
 
 				uint32_t rx, ry, rw, rh, xrleLen, qoiOrigLen;
-				int got;
-				got = recv(skt, (char*)&rx, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rx failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
-				got = recv(skt, (char*)&ry, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv ry failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
-				got = recv(skt, (char*)&rw, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rw failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
-				got = recv(skt, (char*)&rh, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv rh failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
-				got = recv(skt, (char*)&xrleLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv xrleLen failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
-				got = recv(skt, (char*)&qoiOrigLen, 4, MSG_WAITALL); if (got != 4) { SRDPRINTF("ScreenRecvThread: recv qoiOrigLen failed, got=%d\n", got); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&rx, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rx failed\n"); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&ry, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn ry failed\n"); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&rw, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rw failed\n"); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&rh, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rh failed\n"); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&xrleLen, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn xrleLen failed\n"); frame_error = true; lost_connection = true; running = false; break; }
+				if (recvn(skt, (char*)&qoiOrigLen, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn qoiOrigLen failed\n"); frame_error = true; lost_connection = true; running = false; break; }
 				bytesThisFrame += 4 * 6;
 				rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh); xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
 
@@ -1297,20 +1265,11 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				}
 
 				std::vector<uint8_t> xrleData(xrleLen);
-				size_t offset2 = 0;
-				while (offset2 < xrleLen) {
-					got = recv(skt, (char*)(xrleData.data() + offset2), xrleLen - offset2, 0);
-					if (got <= 0) {
-						SRDPRINTF("ScreenRecvThread: recv for xrleData failed, got=%d offset2=%zu\n", got, offset2);
-						frame_error = true; lost_connection = true; running = false; break;
-					}
-					offset2 += got;
-					bytesThisFrame += got;
+				if (recvn(skt, (char*)xrleData.data(), xrleLen) != xrleLen) {
+					SRDPRINTF("ScreenRecvThread: recvn for xrleData failed\n");
+					frame_error = true; lost_connection = true; running = false; break;
 				}
-				if (!running || lost_connection) {
-					SRDPRINTF("ScreenRecvThread: !running after tile data\n");
-					break;
-				}
+				bytesThisFrame += xrleLen;
 
 				qoiData.resize(qoiOrigLen);
 				size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
@@ -2989,7 +2948,9 @@ int MainWindow::ListenThread()
 void ServerInputRecvThread(SOCKET clientSocket) {
 	while (true) {
 		char buffer[sizeof(INPUT) > sizeof(RemoteCtrlMsg) ? sizeof(INPUT) : sizeof(RemoteCtrlMsg)];
-		int received = recv(clientSocket, buffer, sizeof(buffer), 0);
+
+		// Use recvn to ensure we always get a full message (INPUT or RemoteCtrlMsg)
+		int received = recvn(clientSocket, buffer, sizeof(buffer));
 		if (received <= 0) break;
 
 		if (received == sizeof(RemoteCtrlMsg)) {
@@ -3031,7 +2992,6 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 	}
 	closesocket(clientSocket);
 }
-
 int MainWindow::ReceiveThread()
 {
 	while (Client.isConnected && Data.nMode == MODE::CLIENT)
