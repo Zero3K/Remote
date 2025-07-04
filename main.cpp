@@ -44,6 +44,13 @@ struct RemoteWindowPlacement {
 	int height = 600;
 };
 
+void MinimizeConsoleWindow() {
+	HWND hwndConsole = GetConsoleWindow();
+	if (hwndConsole != NULL) {
+		ShowWindow(hwndConsole, SW_MINIMIZE);
+	}
+}
+
 static bool g_headlessClientMode = false;
 
 int recvn(SOCKET s, char* buf, int len) {
@@ -3267,6 +3274,7 @@ void RunHeadlessServer(int port) {
 
 // Minimal client launcher to receive the screen (no UI)// Update RunHeadlessClient to read config.txt and pass geometry to StartScreenRecv
 int RunHeadlessClient(const std::string& ip, int port) {
+	MinimizeConsoleWindow();
 	std::cout << "Starting headless client, connecting to " << ip << ":" << port << std::endl;
 
 	// 1. Load window geometry from config.txt
