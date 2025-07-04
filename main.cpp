@@ -3251,8 +3251,7 @@ void StartServerLogic(int inputPort, int screenPort, bool headless = false) {
 	}
 	std::cout << "Screen streaming server listening on port " << screenPort << std::endl;
 
-	// 3. Accept loop for input and screen sockets
-	//    Each in a thread so both can run at the same time (just like GUI)
+	// 3. Accept loop for input and screen sockets, each in a thread
 	std::thread inputThread([&]() {
 		while (true) {
 			if (listen(inputListenSocket, 1) == SOCKET_ERROR) break;
@@ -3264,6 +3263,22 @@ void StartServerLogic(int inputPort, int screenPort, bool headless = false) {
 		}
 		closesocket(inputListenSocket);
 		});
+
+	std::thread screenThread([&]() {
+		while (true) {
+			if (listen(screenListenSocket, 1) == SOCKET_ERROR) break;
+			sockaddr_in client_addr;
+			int addrlen = sizeof(client_addr);
+			SOCKET sktClient = accept(screenListenSocket, (sockaddr*)&client_addr, &addrlen);
+			if (sktClient == INVALID_SOCKET) continue;
+			std::thread(ScreenStreamServerThread, sktClient).detach();
+		}
+		closesocket(screenListenSocket);
+		});
+
+	// Wait for both threads so the server never exits
+	inputThread.join();
+	screenThread.join();
 }
 
 // Minimal server loop for screen streaming
