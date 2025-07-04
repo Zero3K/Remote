@@ -3268,6 +3268,7 @@ int main(int argc, char* argv[])
 	std::vector<std::string> args(argv + 1, argv + argc);
 	bool isServer = CmdOptionExists(args, "--server");
 	bool isClient = CmdOptionExists(args, "--client");
+	bool isHeadlessClient = isClient && CmdOptionExists(args, "--headless");
 
 	// --- Headless server mode: run true headless server logic and exit ---
 	if (!args.empty() && isServer && !isClient) {
@@ -3284,6 +3285,27 @@ int main(int argc, char* argv[])
 		RunHeadlessServer(port);
 		WSACleanup();
 		return 0;
+	}
+
+	// --- Headless client mode: run true headless client logic and exit ---
+	if (!args.empty() && isHeadlessClient) {
+		std::string ip = GetCmdOption(args, "--ip");
+		std::string portStr = GetCmdOption(args, "--port");
+		int port = DEFAULT_PORT;
+		if (ip.empty() || portStr.empty()) {
+			PrintUsage(argv[0]);
+			WSACleanup();
+			return 1;
+		}
+		try { port = std::stoi(portStr); }
+		catch (...) {
+			std::cerr << "Invalid port: " << portStr << std::endl;
+			WSACleanup();
+			return 1;
+		}
+		int runResult = RunHeadlessClient(ip.c_str(), port);
+		WSACleanup();
+		return runResult;
 	}
 
 	MainWindow win;
