@@ -1689,10 +1689,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	static bool altDown = false;
 	static bool f10Down = false;
 
-	std::cout << "[MSG] msg=0x" << std::hex << msg
-		<< " wParam=0x" << wParam
-		<< " lParam=0x" << lParam << std::dec << std::endl;
-
 	switch (msg) {
 	case WM_CREATE:
 		bmpState = new ScreenBitmapState();
@@ -2039,6 +2035,7 @@ void StartScreenRecv(std::string server_ip, int port) {
 	wc.lpfnWndProc = ScreenWndProc;
 	wc.lpszClassName = "RemoteScreenWnd";
 	wc.hInstance = GetModuleHandle(NULL);
+	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 	RegisterClassA(&wc);
 
 	// --- Restore placement variables from config ---
