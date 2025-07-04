@@ -1685,6 +1685,10 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	// Retrieve per-window state
 	ScreenBitmapState* bmpState = reinterpret_cast<ScreenBitmapState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 
+	// State for Alt and F10 stuck key workaround
+	static bool altDown = false;
+	static bool f10Down = false;
+
 	std::cout << "[MSG] msg=0x" << std::hex << msg
 		<< " wParam=0x" << wParam
 		<< " lParam=0x" << lParam << std::dec << std::endl;
@@ -1798,11 +1802,21 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		break;
 	}
 					  // --- Replace your existing WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP handler in ScreenWndProc with this minimal patch ---
-					  // This ensures modifier combos (CTRL+ALT+KEY, ALT+KEY, etc) work remotely.
+
+					  // --- Special system command suppression for Alt/F10 sticky key workaround ---
+	case WM_SYSCOMMAND:
+		// Prevent activation of system menu by Alt or F10, which causes stuck keys
+		if (wParam == SC_KEYMENU) {
+			return 0;
+		}
+		else {
+			return DefWindowProc(hwnd, msg, wParam, lParam);
+		}
+		// break; // (Unreachable after return)
 
 	case WM_KEYDOWN:
-	case WM_KEYUP: 
-	case WM_SYSKEYDOWN: 
+	case WM_KEYUP:
+	case WM_SYSKEYDOWN:
 	case WM_SYSKEYUP: {
 		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
 			INPUT input = {};
@@ -1810,7 +1824,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			input.ki.wVk = (WORD)wParam;
 			input.ki.wScan = 0; // Let Windows fill this in if needed
 			input.ki.dwFlags = 0;
-			if (msg == WM_KEYUP)
+			if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
 				input.ki.dwFlags |= KEYEVENTF_KEYUP;
 
 			// Set EXTENDEDKEY for extended keys (F10, arrows, navigation, etc.)
@@ -1828,14 +1842,19 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				) {
 				input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
 			}
-			// Special: Numpad Enter is extended, main Enter is not. If you want to handle this, you need to check lParam.
+
+			// Track Alt and F10 down/up to release on focus loss if needed
+			if ((msg == WM_SYSKEYDOWN || msg == WM_KEYDOWN) && wParam == VK_MENU) altDown = true;
+			if ((msg == WM_SYSKEYUP || msg == WM_KEYUP) && wParam == VK_MENU) altDown = false;
+			if ((msg == WM_KEYDOWN) && wParam == VK_F10) f10Down = true;
+			if ((msg == WM_KEYUP) && wParam == VK_F10) f10Down = false;
 
 			// DEBUG LOGGING: Print what is being sent to the server
 			std::cout << "[CLIENT] Sending INPUT: "
 				<< "VK=0x" << std::hex << (int)input.ki.wVk
 				<< " Scan=0x" << std::hex << (int)input.ki.wScan
 				<< " Flags=0x" << std::hex << (int)input.ki.dwFlags
-				<< " (" << ((msg == WM_KEYDOWN) ? "DOWN" : "UP") << ")"
+				<< " (" << (((msg == WM_KEYDOWN) || (msg == WM_SYSKEYDOWN)) ? "DOWN" : "UP") << ")"
 				<< std::dec << std::endl;
 
 			send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
@@ -1843,6 +1862,29 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		break;
 	}
 
+					// --- Focus loss: forcibly release any stuck Alt or F10 keys remotely ---
+	case WM_KILLFOCUS:
+	case WM_ACTIVATE:
+	case WM_SETFOCUS:
+		if (bmpState && bmpState->psktInput && *bmpState->psktInput != INVALID_SOCKET) {
+			if (altDown) {
+				INPUT input = {};
+				input.type = INPUT_KEYBOARD;
+				input.ki.wVk = VK_MENU;
+				input.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+				send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
+				altDown = false;
+			}
+			if (f10Down) {
+				INPUT input = {};
+				input.type = INPUT_KEYBOARD;
+				input.ki.wVk = VK_F10;
+				input.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+				send(*bmpState->psktInput, (const char*)&input, sizeof(INPUT), 0);
+				f10Down = false;
+			}
+		}
+		break;
 
 	case WM_ERASEBKGND:
 		return 1; // Prevent flicker
