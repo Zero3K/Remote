@@ -138,13 +138,12 @@ void CleanupClipboardMonitor(HWND hwnd) {
 }
 
 enum class RemoteCtrlType : uint8_t {
-	SetQuality = 1,
-	SetFps = 2
+	SetFps = 1
 };
 #pragma pack(push, 1)
 struct RemoteCtrlMsg {
 	RemoteCtrlType type;
-	uint8_t value; // quality: [1-4], fps: [5,10,20,30,40,60]
+	uint8_t value; // fps: [5,10,20,30,40,60]
 };
 
 // --- DIRTY TILE STRUCT ---
@@ -251,7 +250,6 @@ extern MainWindow* g_pMainWindow;
 
 #define SCREEN_STREAM_PORT 27016
 #define SCREEN_STREAM_FPS 20
-#define SCREEN_STREAM_QUALITY 60 // JPEG quality
 
 #define BTN_MODE 1
 #define BTN_START 2
@@ -269,12 +267,6 @@ extern MainWindow* g_pMainWindow;
 #define MENU_EXIT 12
 #define MENU_ABOUT 13
 // --- Context menu command IDs for the remote screen window ---
-#define IDM_VIDEO_QUALITY     6001
-#define IDM_VIDEO_QUALITY_1   6002
-#define IDM_VIDEO_QUALITY_2   6003
-#define IDM_VIDEO_QUALITY_3   6004
-#define IDM_VIDEO_QUALITY_4   6005
-#define IDM_VIDEO_QUALITY_5   6006
 
 #define IDM_VIDEO_FPS         6010
 #define IDM_VIDEO_FPS_5       6011
@@ -293,33 +285,20 @@ extern MainWindow* g_pMainWindow;
 #define IDM_SENDKEYS_PRNTSCRN 6034
 
 std::atomic<int> g_streamingFps(SCREEN_STREAM_FPS);
-std::atomic<int> g_streamingQuality(SCREEN_STREAM_QUALITY);
 
 // --- State variables for menu ---
 static bool g_alwaysOnTop = false;
-static int g_screenStreamMenuQuality = SCREEN_STREAM_QUALITY / 20; // 1-4 (default 3)
 static int g_screenStreamMenuFps = SCREEN_STREAM_FPS; // 5, 10, 20, 30, 40, 60
-static int g_screenStreamActualQuality = SCREEN_STREAM_QUALITY;
 static int g_screenStreamActualFps = SCREEN_STREAM_FPS;
 
 // --- Function prototypes for menu logic ---
 HMENU CreateScreenContextMenu();
-void SetRemoteScreenQuality(HWND hwnd, int qualityLevel);
 void SetRemoteScreenFps(HWND hwnd, int fps);
 void SendRemoteKeyCombo(HWND hwnd, int combo);
 
 // --- Helper for context menu creation ---
 HMENU CreateScreenContextMenu() {
 	HMENU hMenu = CreatePopupMenu();
-
-	// Video Quality submenu (choose levels 1-4)
-	HMENU hQualityMenu = CreatePopupMenu();
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 1 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_1, "1 (Low)");
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 2 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_2, "2");
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 3 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_3, "3");
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 4 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_4, "4");
-	AppendMenuA(hQualityMenu, MF_STRING | (g_screenStreamMenuQuality == 5 ? MF_CHECKED : 0), IDM_VIDEO_QUALITY_5, "5 (High)");
-	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hQualityMenu, "Video Quality");
 
 	// Video FPS submenu
 	HMENU hFpsMenu = CreatePopupMenu();
@@ -344,22 +323,8 @@ HMENU CreateScreenContextMenu() {
 	return hMenu;
 }
 
-// --- Helpers for setting quality/fps and sending keys ---
+// --- Helpers for setting fps and sending keys ---
 // These are called from the context menu handler.
-
-void SetRemoteScreenQuality(HWND hwnd, int qualityLevel) {
-	static const int levels[] = { 0, 20, 40, 60, 80 };
-	g_screenStreamMenuQuality = qualityLevel;
-	g_screenStreamActualQuality = levels[qualityLevel];
-
-	// Find the input socket for this window
-	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-	if (!psktInput || *psktInput == INVALID_SOCKET) return;
-
-	// Send control message to server
-	RemoteCtrlMsg msg = { RemoteCtrlType::SetQuality, (uint8_t)qualityLevel };
-	send(*psktInput, (const char*)&msg, sizeof(msg), 0);
-}
 
 // This helper sends special key combos to the remote side
 void SendRemoteKeyCombo(HWND hwnd, int combo) {
@@ -1739,10 +1704,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
-		case IDM_VIDEO_QUALITY_1: SetRemoteScreenQuality(hwnd, 1); break;
-		case IDM_VIDEO_QUALITY_2: SetRemoteScreenQuality(hwnd, 2); break;
-		case IDM_VIDEO_QUALITY_3: SetRemoteScreenQuality(hwnd, 3); break;
-		case IDM_VIDEO_QUALITY_4: SetRemoteScreenQuality(hwnd, 4); break;
 		case IDM_VIDEO_FPS_5: SetRemoteScreenFps(hwnd, 5); break;
 		case IDM_VIDEO_FPS_10: SetRemoteScreenFps(hwnd, 10); break;
 		case IDM_VIDEO_FPS_20: SetRemoteScreenFps(hwnd, 20); break;
@@ -3015,15 +2976,7 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 		if (received == sizeof(RemoteCtrlMsg)) {
 			// Handle control messages from client
 			RemoteCtrlMsg* msg = (RemoteCtrlMsg*)buffer;
-			if (msg->type == RemoteCtrlType::SetQuality) {
-				static const int levels[] = { 20, 40, 60, 80, 100 };
-				int q = msg->value;
-				if (q >= 1 && q <= 5) {
-					g_streamingQuality = levels[q];
-					std::cout << "Set streaming quality to level " << q << " (" << levels[q] << ")\n";
-				}
-			}
-			else if (msg->type == RemoteCtrlType::SetFps) {
+			if (msg->type == RemoteCtrlType::SetFps) {
 				int fps = msg->value;
 				if (fps == 5 || fps == 10 || fps == 20 || fps == 30 || fps == 40 || fps == 60) {
 					g_streamingFps = fps;
