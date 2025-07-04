@@ -35,6 +35,8 @@
 #include <algorithm> // DIRTY TILE
 #pragma comment(lib, "Ws2_32.lib")
 
+static bool g_headlessClientMode = false;
+
 int recvn(SOCKET s, char* buf, int len) {
 	int received = 0;
 	while (received < len) {
@@ -2011,6 +2013,9 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			delete bmpState;
 			SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
 		}
+		if (g_headlessClientMode) {
+			PostQuitMessage(0);
+		}
 		break;
 	}
 	default:
@@ -3355,6 +3360,9 @@ int main(int argc, char* argv[])
 			SendMessage(win.m_btnModeServer.Window(), BM_SETCHECK, BST_UNCHECKED, 0);
 
 			PostMessage(win.Window(), WM_COMMAND, MAKEWPARAM(BTN_CONNECT, BN_CLICKED), 0);
+
+			// Set headless client mode if launched via command line
+			g_headlessClientMode = true;
 		}
 	}
 	// Use loaded position and size from config
