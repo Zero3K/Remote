@@ -1380,9 +1380,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 class BaseWindow
 {
 public:
+	HWND m_hwnd;
+	virtual LRESULT HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam) = 0;
+	
 	static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	{
-		BaseWindow* pThis = NULL;
+		BaseWindow* pThis = nullptr;
 
 		if (uMsg == WM_NCCREATE)
 		{
@@ -1396,8 +1399,19 @@ public:
 		{
 			pThis = (BaseWindow*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 		}
+
 		if (pThis)
 		{
+			if (uMsg == WM_NCDESTROY)
+			{
+				// Optionally: any extra cleanup logic before user data is cleared
+
+				// Clean up GWLP_USERDATA only in WM_NCDESTROY
+				SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+				// If you dynamically allocated pThis and want to delete it here, do so LAST:
+				// delete pThis;
+				return 0;
+			}
 			return pThis->HandleMessage(uMsg, wParam, lParam);
 		}
 		else
@@ -1448,9 +1462,6 @@ public:
 protected:
 
 	virtual LPCSTR ClassName() const = 0;
-	virtual LRESULT HandleMessage(UINT uMsg, WPARAM wParam, LPARAM lParam) = 0;
-
-	HWND m_hwnd;
 	BaseWindow* m_pParent;
 };
 class Button : public BaseWindow
@@ -1545,6 +1556,7 @@ private:
 
 	std::string configName = "config.txt";
 
+public:
 	struct WindowData
 	{
 		std::string sKeyboardState;
@@ -1800,9 +1812,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		break;
 	}
-					  // --- Replace your existing WM_KEYDOWN/WM_KEYUP/WM_SYSKEYDOWN/WM_SYSKEYUP handler in ScreenWndProc with this minimal patch ---
-
-					  // --- Special system command suppression for Alt/F10 sticky key workaround ---
 	case WM_SYSCOMMAND:
 		// Prevent activation of system menu by Alt or F10, which causes stuck keys
 		if (wParam == SC_KEYMENU) {
@@ -1811,7 +1820,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		else {
 			return DefWindowProc(hwnd, msg, wParam, lParam);
 		}
-		// break; // (Unreachable after return)
 
 	case WM_KEYDOWN:
 	case WM_KEYUP:
@@ -1861,7 +1869,6 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		break;
 	}
 
-					// --- Focus loss: forcibly release any stuck Alt or F10 keys remotely ---
 	case WM_KILLFOCUS:
 	case WM_ACTIVATE:
 	case WM_SETFOCUS:
@@ -2002,6 +2009,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			}
 		}
 		break;
+
 	case WM_DESTROY: {
 		static HBITMAP hDoubleBufBmp = NULL;
 		static void* pDoubleBufBits = NULL;
@@ -2012,11 +2020,17 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		}
 		if (bmpState) {
 			delete bmpState;
-			SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+			// Do NOT clear GWLP_USERDATA here!
 		}
-		if (g_headlessClientMode) {
+		// Only quit if in client mode
+		if (g_pMainWindow && g_pMainWindow->Data.nMode == MainWindow::MODE::CLIENT) {
 			PostQuitMessage(0);
 		}
+		break;
+	}
+	case WM_NCDESTROY: {
+		// Now it is safe to clear the user data pointer
+		SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
 		break;
 	}
 	default:
