@@ -507,8 +507,7 @@ std::atomic<int> g_screenStreamH(0);
 void ScreenStreamServerThread(SOCKET sktClient);
 LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port);
-void StartScreenRecv(std::string server_ip, int port, const RemoteWindowPlacement& place);
-
+void StartScreenRecv(const std::string& server_ip, int port, const RemoteWindowPlacement& place, SOCKET* psktInput);
 
 void ServerInputRecvThread(SOCKET clientSocket);
 
@@ -2010,11 +2009,7 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 }
 
 // StartScreenRecv: create remote window and set up state, but do NOT touch GWLP_USERDATA here
-void StartScreenRecv(std::string server_ip, int port, const RemoteWindowPlacement& place) {
-	SOCKET* psktInput = nullptr;
-	if (g_pMainWindow && g_pMainWindow->Client.isConnected)
-		psktInput = &g_pMainWindow->Client.sktServer;
-
+void StartScreenRecv(const std::string& server_ip, int port, const RemoteWindowPlacement& place, SOCKET* psktInput) {
 	SOCKET skt = INVALID_SOCKET;
 	if (ConnectScreenStreamServer(skt, server_ip, port) != 0) {
 		MessageBoxA(NULL, "Failed to connect to screen stream server!", "Remote", MB_OK | MB_ICONERROR);
@@ -2027,7 +2022,6 @@ void StartScreenRecv(std::string server_ip, int port, const RemoteWindowPlacemen
 	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 	RegisterClassA(&wc);
 
-	// Use geometry from config or default
 	int left = place.left;
 	int top = place.top;
 	int w = place.width;
@@ -2036,25 +2030,18 @@ void StartScreenRecv(std::string server_ip, int port, const RemoteWindowPlacemen
 	HWND hwnd = CreateWindowA(wc.lpszClassName, "Remote Screen", WS_OVERLAPPEDWINDOW,
 		left, top, w, h, NULL, NULL, wc.hInstance, NULL);
 
-	// Save HWND to main window if you want access later
-	if (g_pMainWindow)
-		g_pMainWindow->RemoteScreenWnd = hwnd;
-
-	// Pass input socket pointer to the window
+	// Pass input socket pointer to the window (THIS IS CRITICAL)
 	SendMessage(hwnd, WM_USER + 100, 0, (LPARAM)psktInput);
 
 	ShowWindow(hwnd, SW_SHOWNORMAL);
 
-	// Use actual connected socket to get the true server IP and port
 	std::pair<std::string, int> server_info = GetPeerIpAndPort(skt);
 	std::string actual_server_ip = server_info.first;
 	int actual_server_port = server_info.second;
 
-	// Launch the screen receive thread with correct info
 	std::thread t(ScreenRecvThread, skt, hwnd, actual_server_ip, actual_server_port);
 	t.detach();
 
-	// Standard window message loop
 	MSG msg = { 0 };
 	while (IsWindow(hwnd) && GetMessage(&msg, NULL, 0, 0)) {
 		TranslateMessage(&msg);
@@ -2062,7 +2049,6 @@ void StartScreenRecv(std::string server_ip, int port, const RemoteWindowPlacemen
 		if (!IsWindow(hwnd)) break;
 	}
 
-	// Cleanup: close socket if needed
 	if (skt != INVALID_SOCKET) {
 		closesocket(skt);
 	}
@@ -2895,7 +2881,7 @@ int MainWindow::ClientConnect()
 		Client.tSendInput.detach();
 		Client.tRecv.detach();
 		// SCREEN STREAM: Start a new window to receive the screen stream
-		std::thread([ip = Client.ip](){
+		std::thread([this, ip = Client.ip]() {
 			RemoteWindowPlacement place;
 
 			// Load from config.txt if present
@@ -2917,7 +2903,8 @@ int MainWindow::ClientConnect()
 					}
 				}
 			}
-			StartScreenRecv(ip, SCREEN_STREAM_PORT, place);
+			static SOCKET inputSocket = INVALID_SOCKET;
+			StartScreenRecv(ip, SCREEN_STREAM_PORT, place, &this->Client.sktServer);
 		}).detach();
 		Log("Screen streaming client started");
 	}
@@ -3281,7 +3268,8 @@ void RunHeadlessServer(int port) {
 // Minimal client launcher to receive the screen (no UI)// Update RunHeadlessClient to read config.txt and pass geometry to StartScreenRecv
 int RunHeadlessClient(const std::string& ip, int port) {
 	std::cout << "Starting headless client, connecting to " << ip << ":" << port << std::endl;
-	// Minimal config.txt parser for remote_rect
+
+	// 1. Load window geometry from config.txt
 	RemoteWindowPlacement place;
 	std::ifstream f("config.txt");
 	if (f) {
@@ -3301,34 +3289,24 @@ int RunHeadlessClient(const std::string& ip, int port) {
 			}
 		}
 	}
-	// Connect to input/control server
+
+	// 2. Connect to input/control server (main port)
+	static SOCKET inputSocket = INVALID_SOCKET; // Must remain valid for the window's lifetime!
 	InitializeClient();
-	SOCKET inputSocket = INVALID_SOCKET;
 	if (ConnectServer(inputSocket, ip, port) != 0) {
 		std::cerr << "HeadlessClient: couldn't connect to input/control server" << std::endl;
 		return 1;
 	}
-	std::atomic<bool> inputConnected = true;
-	std::thread tRecv([&]() {
-		while (inputConnected) {
-			INPUT recvBuff;
-			int error = ReceiveServer(inputSocket, recvBuff);
-			if (error == 0) {
-				// Optional: process input
-			}
-			else {
-				std::cout << "HeadlessClient: input receive failed, disconnecting" << std::endl;
-				inputConnected = false;
-			}
-		}
-		});
-	// Pass geometry to StartScreenRecv
-	StartScreenRecv(ip, SCREEN_STREAM_PORT, place);
-	inputConnected = false;
+	std::cout << "HeadlessClient: connected to input/control server!" << std::endl;
+
+	// 3. Start screen receiving window (pass input socket pointer for control)
+	//    You must update StartScreenRecv to take the SOCKET* parameter as shown below!
+	StartScreenRecv(ip, SCREEN_STREAM_PORT, place, &inputSocket);
+
+	// 4. Cleanup after the screen window closes
 	if (inputSocket != INVALID_SOCKET) {
 		closesocket(inputSocket);
 	}
-	if (tRecv.joinable()) tRecv.join();
 	std::cout << "Headless client exiting.\n";
 	return 0;
 }
