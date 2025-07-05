@@ -21,6 +21,9 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <windowsx.h>
+#include <mmsystem.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
 
 #include <objidl.h>
 #include "qoi.h"
@@ -34,7 +37,10 @@
 #include <set> // DIRTY TILE
 #include <algorithm> // DIRTY TILE
 #pragma comment(lib, "Ws2_32.lib")
-//#pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+
 
 // Add a helper struct for window placement
 struct RemoteWindowPlacement {
@@ -258,6 +264,192 @@ bool QOIEncodeSubimage_BasicBitmap(
 	free(qoi_data);
 	return true;
 }
+
+#define AUDIO_STREAM_PORT 27017
+
+
+bool StartWASAPILoopbackCapture(IAudioClient** outAudioClient, IAudioCaptureClient** outCaptureClient, WAVEFORMATEX** outFormat) {
+	CoInitialize(nullptr);
+	IMMDeviceEnumerator* pEnumerator = nullptr;
+	IMMDevice* pDevice = nullptr;
+	IAudioClient* pAudioClient = nullptr;
+	IAudioCaptureClient* pCaptureClient = nullptr;
+
+	if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnumerator)))) return false;
+	if (FAILED(pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice))) { pEnumerator->Release(); return false; }
+	if (FAILED(pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient))) { pDevice->Release(); pEnumerator->Release(); return false; }
+
+	WAVEFORMATEX* pwfx = nullptr;
+	if (FAILED(pAudioClient->GetMixFormat(&pwfx))) { pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); return false; }
+	if (FAILED(pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, pwfx, nullptr))) {
+		CoTaskMemFree(pwfx);
+		pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); return false;
+	}
+	if (FAILED(pAudioClient->GetService(IID_PPV_ARGS(&pCaptureClient)))) {
+		pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); return false;
+	}
+	if (FAILED(pAudioClient->Start())) {
+		pCaptureClient->Release(); pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); return false;
+	}
+
+	*outAudioClient = pAudioClient;
+	*outCaptureClient = pCaptureClient;
+	*outFormat = pwfx; // caller must CoTaskMemFree()
+	pDevice->Release();
+	pEnumerator->Release();
+	return true;
+}
+
+void AudioStreamServerThreadXRLE(SOCKET clientSock) {
+	IAudioClient* audioClient = nullptr;
+	IAudioCaptureClient* captureClient = nullptr;
+	WAVEFORMATEX* pwfx = nullptr;
+	if (!StartWASAPILoopbackCapture(&audioClient, &captureClient, &pwfx)) {
+		closesocket(clientSock);
+		return;
+	}
+
+	// (Optional) Print server format
+	printf("SERVER: tag=%04x chans=%d samplerate=%d bits=%d blockalign=%d avgbytes=%d cbSize=%d\n",
+		pwfx->wFormatTag, pwfx->nChannels, pwfx->nSamplesPerSec, pwfx->wBitsPerSample,
+		pwfx->nBlockAlign, pwfx->nAvgBytesPerSec, pwfx->cbSize);
+
+	size_t wfexSendSize = sizeof(WAVEFORMATEX);
+	if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->cbSize >= 22) {
+		wfexSendSize += pwfx->cbSize;
+	}
+	const uint8_t* wfexBytes = reinterpret_cast<const uint8_t*>(pwfx);
+	if (send(clientSock, (const char*)wfexBytes, (int)wfexSendSize, 0) != (int)wfexSendSize) {
+		goto end;
+	}
+
+	const int FRAMES_PER_BUFFER = 4096;
+	while (true) {
+		UINT32 packetLength = 0;
+		if (FAILED(captureClient->GetNextPacketSize(&packetLength))) break;
+		if (packetLength == 0) { Sleep(5); continue; }
+
+		BYTE* pData;
+		UINT32 nFrames;
+		DWORD flags;
+		if (FAILED(captureClient->GetBuffer(&pData, &nFrames, &flags, nullptr, nullptr))) break;
+		if (nFrames == 0) { captureClient->ReleaseBuffer(0); continue; }
+
+		int bytes_uncompressed = nFrames * pwfx->nBlockAlign;
+		std::vector<uint8_t> xrle_buf(bytes_uncompressed * 2); // enough space for worst-case
+		size_t bytes_compressed = xrle_compress(xrle_buf.data(), (uint8_t*)pData, bytes_uncompressed);
+
+		uint32_t net_uncompressed = htonl(bytes_uncompressed);
+		uint32_t net_compressed = htonl((uint32_t)bytes_compressed);
+		if (send(clientSock, (char*)&net_uncompressed, 4, 0) != 4) break;
+		if (send(clientSock, (char*)&net_compressed, 4, 0) != 4) break;
+		if (send(clientSock, (char*)xrle_buf.data(), (int)bytes_compressed, 0) != (int)bytes_compressed) break;
+
+		captureClient->ReleaseBuffer(nFrames);
+	}
+end:
+	audioClient->Stop();
+	captureClient->Release();
+	audioClient->Release();
+	CoTaskMemFree(pwfx); // <-- free mix format when done
+	closesocket(clientSock);
+}
+
+// Helper: check if WAVEFORMATEX is actually WAVEFORMATEXTENSIBLE
+bool IsWaveFormatExtensible(const WAVEFORMATEX* wfex) {
+	return (wfex->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wfex->cbSize >= 22);
+}
+
+void AudioStreamClientThreadXRLE(const std::string& serverIp) {
+	// Networking: (same as before)
+	SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(AUDIO_STREAM_PORT);
+	inet_pton(AF_INET, serverIp.c_str(), &addr.sin_addr);
+	if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(sock); return; }
+
+	// Receive format struct from server
+	WAVEFORMATEX wfex = {};
+	if (recvn(sock, (char*)&wfex, sizeof(WAVEFORMATEX)) != sizeof(WAVEFORMATEX)) { closesocket(sock); return; }
+	std::vector<uint8_t> extBytes;
+	std::vector<uint8_t> fullFmt;
+	const WAVEFORMATEX* pwfx = &wfex;
+	if (IsWaveFormatExtensible(&wfex)) {
+		extBytes.resize(wfex.cbSize);
+		if (recvn(sock, (char*)extBytes.data(), wfex.cbSize) != wfex.cbSize) {
+			closesocket(sock); return;
+		}
+		fullFmt.resize(sizeof(WAVEFORMATEX) + extBytes.size());
+		memcpy(fullFmt.data(), &wfex, sizeof(WAVEFORMATEX));
+		memcpy(fullFmt.data() + sizeof(WAVEFORMATEX), extBytes.data(), extBytes.size());
+		pwfx = (const WAVEFORMATEX*)fullFmt.data();
+	}
+
+	// WASAPI Initialization
+	CoInitialize(nullptr);
+	IMMDeviceEnumerator* pEnumerator = nullptr;
+	IMMDevice* pDevice = nullptr;
+	IAudioClient* pAudioClient = nullptr;
+	IAudioRenderClient* pRenderClient = nullptr;
+
+	if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&pEnumerator)))) { closesocket(sock); CoUninitialize(); return; }
+	if (FAILED(pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice))) { pEnumerator->Release(); closesocket(sock); CoUninitialize(); return; }
+	if (FAILED(pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient))) { pDevice->Release(); pEnumerator->Release(); closesocket(sock); CoUninitialize(); return; }
+
+	// Use the server's format (pwfx) directly:
+	REFERENCE_TIME bufferDuration = 1000000; // 100ms
+	if (FAILED(pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, bufferDuration, 0, pwfx, nullptr))) {
+		pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); closesocket(sock); CoUninitialize(); return;
+	}
+	if (FAILED(pAudioClient->GetService(IID_PPV_ARGS(&pRenderClient)))) {
+		pAudioClient->Release(); pDevice->Release(); pEnumerator->Release(); closesocket(sock); CoUninitialize(); return;
+	}
+	UINT32 bufferFrameCount = 0;
+	pAudioClient->GetBufferSize(&bufferFrameCount);
+
+	pAudioClient->Start();
+
+	while (true) {
+		uint32_t net_bytes_uncompressed, net_bytes_compressed;
+		if (recvn(sock, (char*)&net_bytes_uncompressed, 4) != 4) break;
+		if (recvn(sock, (char*)&net_bytes_compressed, 4) != 4) break;
+		uint32_t bytes_uncompressed = ntohl(net_bytes_uncompressed);
+		uint32_t bytes_compressed = ntohl(net_bytes_compressed);
+
+		std::vector<uint8_t> xrle_buf(bytes_compressed);
+		if (recvn(sock, (char*)xrle_buf.data(), bytes_compressed) != (int)bytes_compressed) break;
+		std::vector<uint8_t> pcm_buf(bytes_uncompressed);
+		if (xrle_decompress(pcm_buf.data(), xrle_buf.data(), bytes_compressed) != bytes_uncompressed) break;
+
+		UINT32 framesToWrite = (bytes_uncompressed / pwfx->nBlockAlign);
+		UINT32 framesWritten = 0;
+		while (framesToWrite > 0) {
+			UINT32 padding = 0;
+			pAudioClient->GetCurrentPadding(&padding);
+			UINT32 bufferFrameCountFree = bufferFrameCount - padding;
+			UINT32 chunk = std::min(framesToWrite, bufferFrameCountFree);
+			if (chunk == 0) { Sleep(5); continue; }
+
+			BYTE* pData = nullptr;
+			if (FAILED(pRenderClient->GetBuffer(chunk, &pData))) { break; }
+			memcpy(pData, pcm_buf.data() + framesWritten * pwfx->nBlockAlign, chunk * pwfx->nBlockAlign);
+			pRenderClient->ReleaseBuffer(chunk, 0);
+
+			framesToWrite -= chunk;
+			framesWritten += chunk;
+		}
+	}
+
+	pAudioClient->Stop();
+	pRenderClient->Release();
+	pAudioClient->Release();
+	pDevice->Release();
+	pEnumerator->Release();
+	closesocket(sock);
+	CoUninitialize();
+}
+
 
 class MainWindow; // forward declaration, so 'extern MainWindow* ...' is legal
 extern MainWindow* g_pMainWindow;
@@ -575,6 +767,24 @@ int InitializeScreenStreamServer(SOCKET& sktListen, int port) {
 	return InitializeServer(sktListen, port);
 }
 
+// Add this function if you want to refactor for a cleaner thread:
+void AudioStreamAcceptLoop(int port) {
+	SOCKET listenSock = INVALID_SOCKET;
+	if (InitializeScreenStreamServer(listenSock, port) != 0) {
+		std::cerr << "Audio stream server failed to start on port " << port << std::endl;
+		return;
+	}
+	while (true) {
+		if (listen(listenSock, 1) == SOCKET_ERROR) break;
+		sockaddr_in client_addr;
+		int addrlen = sizeof(client_addr);
+		SOCKET sktClient = accept(listenSock, (sockaddr*)&client_addr, &addrlen);
+		if (sktClient == INVALID_SOCKET) continue;
+		std::thread(AudioStreamServerThreadXRLE, sktClient).detach();
+	}
+	closesocket(listenSock);
+}
+
 int BroadcastInput(std::vector<SOCKET> vsktSend, INPUT* input) {
 	int iResult = 0;
 
@@ -742,8 +952,26 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	send(sktClient, (const char*)&heightNet, 4, 0);
 	SSDPRINTF("ScreenStreamServerThread: sent initial screen size %dx%d\n", screen_width, screen_height);
 
+	// --- Start XRLE audio streaming in parallel ---
+	std::thread audioThread([sktClient]() {
+		// Each client should get a separate audio socket/connection.
+		// If you want to use the same socket as screen, use sktClient directly.
+		// Otherwise, accept a separate connection and call AudioStreamServerThreadXRLE().
+		// Here, we assume a **separate audio socket** (recommended), so nothing here.
+		// If you want to use the same socket, call AudioStreamServerThreadXRLE() here:
+		// AudioStreamServerThreadXRLE(sktClient);
+
+		// If your design is to use a SEPARATE socket, you simply launch the audio server thread elsewhere.
+		// If your design is to use the SAME socket for both video and audio, you can call:
+		// AudioStreamServerThreadXRLE(sktClient);
+
+		// For most remote desktop designs, audio and screen use SEPARATE sockets.
+		// So you likely do NOT need to call AudioStreamServerThreadXRLE here.
+		// Remove or adapt this lambda as needed for your architecture.
+		});
+	audioThread.detach();
+
 	// --- Clipboard: allow receiving clipboard packets from client and apply locally ---
-	// You may want a non-blocking socket or select() for production, here we check at each frame
 	auto try_receive_clipboard = [&]() {
 		u_long nonblock = 1;
 		ioctlsocket(sktClient, FIONBIO, &nonblock);
@@ -753,7 +981,6 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			ClipboardMsg* cmsg = (ClipboardMsg*)cbuf;
 			int total_len = int(sizeof(ClipboardMsg) + cmsg->length);
 			if (cmsg->type == MsgType::Clipboard && peeked >= total_len) {
-				// Now receive the full message using recvn
 				std::vector<char> msgbuf(total_len);
 				int recvd = recvn(sktClient, msgbuf.data(), total_len);
 				if (recvd == total_len) {
@@ -771,7 +998,6 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 	};
 
 	while (g_screenStreamActive) {
-		// Check for clipboard data from client
 		try_receive_clipboard();
 
 		int fps = g_streamingFps.load();
@@ -791,13 +1017,11 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		size_t tiles_y = (height + TILE_H - 1) / TILE_H;
 		size_t numTiles = tiles_x * tiles_y;
 
-		// --- Compute dirty bitmask and tile list ---
 		std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8, 0);
 		std::vector<std::pair<int, int>> DirtyTileIndices;
 
 		frameCounter++;
 		if (first || frameCounter % 60 == 0) {
-			// Force full refresh periodically
 			for (size_t ty = 0; ty < tiles_y; ++ty)
 				for (size_t tx = 0; tx < tiles_x; ++tx) {
 					size_t tidx = ty * tiles_x + tx;
@@ -833,12 +1057,8 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 						}
 					}
 				}
-				if (DirtyTileIndices.empty()) {
-					SSDPRINTF("ScreenStreamServerThread: No dirty tiles detected in this frame!\n");
-				}
 			}
 			else {
-				// Fallback: screen size changed, force full refresh
 				for (size_t ty = 0; ty < tiles_y; ++ty)
 					for (size_t tx = 0; tx < tiles_x; ++tx) {
 						size_t tidx = ty * tiles_x + tx;
@@ -848,31 +1068,17 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			}
 		}
 
-		// --- Debug output: tiles and bitmask ---
-		SSDPRINTF("ScreenStreamServerThread: width=%d height=%d tiles_x=%zu tiles_y=%zu numTiles=%zu dirtyTiles=%zu\n",
-			width, height, tiles_x, tiles_y, numTiles, DirtyTileIndices.size());
-		for (auto& idx : DirtyTileIndices)
-			SSDPRINTF("ScreenStreamServerThread: Dirty tile tx=%d ty=%d\n", idx.first, idx.second);
-		SSDPRINTF("ScreenStreamServerThread: DirtyBitmask: ");
-		for (size_t b = 0; b < dirtyBitmask.size(); ++b)
-			SSDPRINTF("%02X", dirtyBitmask[b]);
-		SSDPRINTF("\n");
-
-		// --- XRLE compress and send the dirty tile bitmask ---
 		std::vector<uint8_t> xrleBitmask(std::max<size_t>(1, dirtyBitmask.size() * 2));
 		size_t xrleBitmaskLen = xrle_compress(xrleBitmask.data(), dirtyBitmask.data(), dirtyBitmask.size());
 		xrleBitmask.resize(xrleBitmaskLen);
-		// Send the bitmask length and data
 		uint32_t xrleBitmaskLenNet = htonl((uint32_t)xrleBitmaskLen);
 		send(sktClient, (const char*)&xrleBitmaskLenNet, 4, 0);
 		if (xrleBitmaskLen > 0)
 			send(sktClient, (const char*)xrleBitmask.data(), xrleBitmaskLen, 0);
 
-		// --- Send number of dirty tiles ---
 		uint32_t nTilesNet = htonl((uint32_t)DirtyTileIndices.size());
 		send(sktClient, (const char*)&nTilesNet, 4, 0);
 
-		// --- Send all dirty tiles in grid order ---
 		size_t tileSeq = 0;
 		for (const auto& idx : DirtyTileIndices) {
 			int tx = idx.first, ty = idx.second;
@@ -900,9 +1106,6 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			uint32_t hNet = htonl(tileH);
 			uint32_t xrleLenNet = htonl((uint32_t)xrleData.size());
 			uint32_t qoiOrigLenNet = htonl((uint32_t)qoiData.size());
-
-			SSDPRINTF("ScreenStreamServerThread: Sending tile #%zu at (%d,%d) size %dx%d, xrleSize=%zu, qoiSize=%zu\n",
-				tileSeq, tileLeft, tileTop, tileW, tileH, xrleData.size(), qoiData.size());
 
 			send(sktClient, (const char*)&xNet, 4, 0);
 			send(sktClient, (const char*)&yNet, 4, 0);
@@ -1016,6 +1219,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 		// char data[] follows
 	};
 #pragma pack(pop)
+
+	// --- Start XRLE audio receiving thread (runs in parallel with screen) ---
+	std::thread audioThread([ip]() {
+		AudioStreamClientThreadXRLE(ip);
+		});
+	audioThread.detach();
 
 	while (true) {
 		if (!WindowStillOpen(hwnd)) {
@@ -1139,7 +1348,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				return;
 			}
 
-			// ... the rest of your original streaming loop is unchanged ...
+			// ... rest of streaming loop unchanged ...
 			uint32_t xrleBitmaskLenNet = 0;
 			if (recvn(skt, (char*)&xrleBitmaskLenNet, 4) != 4) {
 				SRDPRINTF("ScreenRecvThread: recvn for bitmask length failed\n");
@@ -2817,6 +3026,29 @@ int MainWindow::ServerStart()
 			delete sktScreenListenPtr;
 			Log("Could not start screen streaming server");
 		}
+
+		// AUDIO STREAM: Start an audio stream server socket on AUDIO_STREAM_PORT
+		SOCKET* sktAudioListenPtr = new SOCKET(INVALID_SOCKET);
+		if (InitializeScreenStreamServer(*sktAudioListenPtr, AUDIO_STREAM_PORT) == 0) {
+			std::thread([sktAudioListenPtr]() {
+				while (true) {
+					if (listen(*sktAudioListenPtr, 1) == SOCKET_ERROR) break;
+					sockaddr_in client_addr;
+					int addrlen = sizeof(client_addr);
+					SOCKET sktClient = accept(*sktAudioListenPtr, (sockaddr*)&client_addr, &addrlen);
+					if (sktClient == INVALID_SOCKET) continue;
+					std::thread(AudioStreamServerThreadXRLE, sktClient).detach();
+				}
+				closesocket(*sktAudioListenPtr);
+				delete sktAudioListenPtr;
+				}).detach();
+				Log("Audio streaming server started");
+		}
+		else {
+			delete sktAudioListenPtr;
+			Log("Could not start audio streaming server");
+		}
+
 		Server.tListen.detach();
 	}
 	return 0;
@@ -3251,7 +3483,17 @@ void StartServerLogic(int inputPort, int screenPort, bool headless = false) {
 	}
 	std::cout << "Screen streaming server listening on port " << screenPort << std::endl;
 
-	// 3. Accept loop for input and screen sockets, each in a thread
+	// 2.5. Start audio streaming server (accepts audio stream requests from clients)
+	SOCKET audioListenSocket = INVALID_SOCKET;
+	if (InitializeScreenStreamServer(audioListenSocket, AUDIO_STREAM_PORT) != 0) {
+		std::cerr << "Failed to initialize audio stream server!" << std::endl;
+		closesocket(inputListenSocket);
+		closesocket(screenListenSocket);
+		return;
+	}
+	std::cout << "Audio streaming server listening on port " << AUDIO_STREAM_PORT << std::endl;
+
+	// 3. Accept loop for input, screen, and audio sockets, each in a thread
 	std::thread inputThread([&]() {
 		while (true) {
 			if (listen(inputListenSocket, 1) == SOCKET_ERROR) break;
@@ -3276,9 +3518,22 @@ void StartServerLogic(int inputPort, int screenPort, bool headless = false) {
 		closesocket(screenListenSocket);
 		});
 
-	// Wait for both threads so the server never exits
+	std::thread audioThread([&]() {
+		while (true) {
+			if (listen(audioListenSocket, 1) == SOCKET_ERROR) break;
+			sockaddr_in client_addr;
+			int addrlen = sizeof(client_addr);
+			SOCKET sktClient = accept(audioListenSocket, (sockaddr*)&client_addr, &addrlen);
+			if (sktClient == INVALID_SOCKET) continue;
+			std::thread(AudioStreamServerThreadXRLE, sktClient).detach();
+		}
+		closesocket(audioListenSocket);
+		});
+
+	// Wait for all threads so the server never exits
 	inputThread.join();
 	screenThread.join();
+	audioThread.join();
 }
 
 // Minimal server loop for screen streaming
