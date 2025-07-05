@@ -76,9 +76,12 @@ bool StartRemoteExeAsActiveUser(const std::string& dir, const std::string& port,
 
     STARTUPINFOA si = { sizeof(si) };
     si.lpDesktop = (LPSTR)"winsta0\\default";
+    // ADD THIS FLAG TO HIDE CONSOLE:
+    DWORD creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+
     BOOL ok = CreateProcessAsUserA(
         userTokenDup, exe.c_str(), &cmdLine[0], NULL, NULL, FALSE,
-        CREATE_UNICODE_ENVIRONMENT, env, dir.c_str(), &si, &pi
+        creationFlags, env, dir.c_str(), &si, &pi
     );
     DestroyEnvironmentBlock(env);
     CloseHandle(userTokenDup);
