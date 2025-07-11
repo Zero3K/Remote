@@ -420,7 +420,12 @@ public:
 			while (!shouldExit.load()) {
 				if (hasWork.load()) {
 					// Perform SIMD-optimized conversion
-					ColorConversion::ConvertRGBAToBGRA(currentJob.src, currentJob.dst, currentJob.pixelCount);
+					if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
+						ColorConversion::ConvertRGBAToBGRA(currentJob.src, currentJob.dst, currentJob.pixelCount);
+					} else {
+						// Fallback to scalar conversion if function pointer not initialized
+						ColorConversion::ConvertRGBAToBGRA_Scalar(currentJob.src, currentJob.dst, currentJob.pixelCount);
+					}
 					currentJob.complete.store(true);
 					hasWork.store(false);
 				}
@@ -1933,7 +1938,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				}
 				
 				// Perform ultra-fast SIMD color conversion
-				ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
+				if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
+					ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
+				} else {
+					// Fallback to scalar conversion if function pointer not initialized
+					ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
+				}
 				
 				// Update lock-free frame buffer - this never blocks the UI thread!
 				g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
@@ -4022,6 +4032,9 @@ int main(int argc, char* argv[])
 		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
 		return 1;
 	}
+
+	// Initialize optimal color conversion function pointer
+	ColorConversion::InitializeOptimalConverter();
 
 	// --- Command line mode check ---
 	std::vector<std::string> args(argv + 1, argv + argc);
