@@ -1,3 +1,18 @@
+/*
+ * Performance Improvements Applied:
+ * 
+ * 1. Increased default FPS from 20 to 30 for smoother user experience
+ * 2. Optimized screen capture by reusing GDI resources between frames
+ * 3. Added SIMD-optimized color conversion using existing framework
+ * 4. Set high thread priorities for screen streaming and input processing
+ * 5. Optimized socket settings with TCP_NODELAY for lower latency
+ * 6. Improved dirty tile detection with 64-bit memory comparisons
+ * 7. Pre-allocated buffers to reduce memory allocations in hot paths
+ * 8. Increased compression threshold for better performance vs quality balance
+ * 9. Removed debug logging from production input handling
+ * 10. Added CAPTUREBLT flag for better screen capture on modern systems
+ */
+
 #define QOI_IMPLEMENTATION
 #define WIN32_LEAN_AND_MEAN
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -907,7 +922,7 @@ extern MainWindow* g_pMainWindow;
 
 
 #define SCREEN_STREAM_PORT 27016
-#define SCREEN_STREAM_FPS 20
+#define SCREEN_STREAM_FPS 30
 
 #define BTN_MODE 1
 #define BTN_START 2
@@ -1035,39 +1050,85 @@ int nScreenHeight[2] = { 1080 , 1440 };
 
 const int nNormalized = 65535;
 
-// --- Capture screen to BasicBitmap, with RGBA output ---
-// --- Capture screen into a BasicBitmap (RGBA) ---
+// --- Capture screen to BasicBitmap, with RGBA output and optimizations ---
 bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
+	static HDC hScreenDC = nullptr;
+	static HDC hMemDC = nullptr;
+	static HBITMAP hBitmap = nullptr;
+	static void* pBits = nullptr;
+	static int lastWidth = 0, lastHeight = 0;
+	
 	int width = GetSystemMetrics(SM_CXSCREEN);
 	int height = GetSystemMetrics(SM_CYSCREEN);
-	HDC hScreenDC = GetDC(NULL);
-	BITMAPINFO bmi = { 0 };
-	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bmi.bmiHeader.biWidth = width;
-	bmi.bmiHeader.biHeight = -height;
-	bmi.bmiHeader.biPlanes = 1;
-	bmi.bmiHeader.biBitCount = 32;
-	bmi.bmiHeader.biCompression = BI_RGB;
-	void* pBits = nullptr;
-	HBITMAP hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-	if (!hBitmap) { ReleaseDC(NULL, hScreenDC); return false; }
-	HDC hMemDC = CreateCompatibleDC(hScreenDC);
-	HGDIOBJ oldObj = SelectObject(hMemDC, hBitmap);
-	BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY);
-	SelectObject(hMemDC, oldObj);
-	DeleteDC(hMemDC);
-	ReleaseDC(NULL, hScreenDC);
-
+	
+	// Only recreate resources if screen size changed
+	bool needsRecreate = (width != lastWidth || height != lastHeight || !hBitmap);
+	
+	if (needsRecreate) {
+		// Clean up old resources
+		if (hBitmap) {
+			if (hMemDC) SelectObject(hMemDC, GetStockObject(NULL_BITMAP));
+			DeleteObject(hBitmap);
+		}
+		if (hMemDC) DeleteDC(hMemDC);
+		if (hScreenDC) ReleaseDC(NULL, hScreenDC);
+		
+		// Create new resources
+		hScreenDC = GetDC(NULL);
+		if (!hScreenDC) return false;
+		
+		BITMAPINFO bmi = { 0 };
+		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth = width;
+		bmi.bmiHeader.biHeight = -height; // Top-down DIB for optimal performance
+		bmi.bmiHeader.biPlanes = 1;
+		bmi.bmiHeader.biBitCount = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+		
+		hBitmap = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+		if (!hBitmap) {
+			ReleaseDC(NULL, hScreenDC);
+			hScreenDC = nullptr;
+			return false;
+		}
+		
+		hMemDC = CreateCompatibleDC(hScreenDC);
+		if (!hMemDC) {
+			DeleteObject(hBitmap);
+			ReleaseDC(NULL, hScreenDC);
+			hScreenDC = nullptr;
+			hBitmap = nullptr;
+			return false;
+		}
+		
+		SelectObject(hMemDC, hBitmap);
+		lastWidth = width;
+		lastHeight = height;
+	}
+	
+	// Perform the actual screen capture with optimized BitBlt
+	if (!BitBlt(hMemDC, 0, 0, width, height, hScreenDC, 0, 0, SRCCOPY | CAPTUREBLT)) {
+		return false;
+	}
+	
+	// Create BasicBitmap and convert colors using optimized SIMD function
 	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
 	uint8_t* src = static_cast<uint8_t*>(pBits);
 	uint8_t* dst = bmp->Bits();
-	for (int i = 0; i < width * height; ++i) {
-		dst[i * 4 + 0] = src[i * 4 + 2]; // R
-		dst[i * 4 + 1] = src[i * 4 + 1]; // G
-		dst[i * 4 + 2] = src[i * 4 + 0]; // B
-		dst[i * 4 + 3] = 255;
+	
+	// Use the optimized color conversion if available
+	if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
+		ColorConversion::ConvertRGBAToBGRA(src, dst, width * height);
+	} else {
+		// Fallback to manual conversion
+		for (int i = 0; i < width * height; ++i) {
+			dst[i * 4 + 0] = src[i * 4 + 2]; // R
+			dst[i * 4 + 1] = src[i * 4 + 1]; // G
+			dst[i * 4 + 2] = src[i * 4 + 0]; // B
+			dst[i * 4 + 3] = 255;            // A
+		}
 	}
-	DeleteObject(hBitmap);
+	
 	outBmp = bmp;
 	return true;
 }
@@ -1314,6 +1375,17 @@ int ConnectServer(SOCKET& sktConn, std::string serverAdd, int port) {
 		std::cout << "Unable to connect to server" << std::endl;
 		return 1;
 	}
+	
+	// Optimize socket for low-latency communication
+	int nodelay = 1;
+	setsockopt(sktConn, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+	
+	// Set socket buffer sizes for better performance
+	int sendbuf = 64 * 1024; // 64KB send buffer
+	int recvbuf = 64 * 1024; // 64KB receive buffer
+	setsockopt(sktConn, SOL_SOCKET, SO_SNDBUF, (char*)&sendbuf, sizeof(sendbuf));
+	setsockopt(sktConn, SOL_SOCKET, SO_RCVBUF, (char*)&recvbuf, sizeof(recvbuf));
+	
 	return 0;
 }
 
@@ -1359,6 +1431,12 @@ int CloseConnection(SOCKET* sktConn) {
 
 void ScreenStreamServerThread(SOCKET sktClient) {
 	using namespace std::chrono;
+
+	// Set high thread priority for smoother streaming performance
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	
+	// Set process priority class to high for better responsiveness
+	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
 	// --- Clipboard protocol structures (should match recvn side) ---
 	enum class MsgType : uint8_t {
@@ -1485,6 +1563,8 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		else {
 			if (prevBmp && prevBmp->Width() == width && prevBmp->Height() == height) {
 				const uint8_t* prev = prevBmp->Bits();
+				
+				// Optimized dirty tile detection using SIMD-friendly comparisons
 				for (size_t ty = 0; ty < tiles_y; ++ty) {
 					for (size_t tx = 0; tx < tiles_x; ++tx) {
 						int tileLeft = (int)(tx * TILE_W);
@@ -1492,13 +1572,34 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 						int tileW = std::min(TILE_W, width - tileLeft);
 						int tileH = std::min(TILE_H, height - tileTop);
 						bool dirty = false;
-						for (int row = 0; row < tileH; ++row) {
+						
+						// Use optimized memory comparison for better performance
+						const size_t rowBytes = tileW * 4;
+						for (int row = 0; row < tileH && !dirty; ++row) {
 							int y = tileTop + row;
 							const uint8_t* prevRow = prev + (y * width + tileLeft) * 4;
 							const uint8_t* currRow = curr_rgba + (y * width + tileLeft) * 4;
-							if (memcmp(prevRow, currRow, tileW * 4) != 0) {
-								dirty = true;
-								break;
+							
+							// Use 64-bit comparison for better performance on aligned data
+							const uint64_t* prev64 = reinterpret_cast<const uint64_t*>(prevRow);
+							const uint64_t* curr64 = reinterpret_cast<const uint64_t*>(currRow);
+							size_t qwords = rowBytes / 8;
+							
+							for (size_t i = 0; i < qwords; ++i) {
+								if (prev64[i] != curr64[i]) {
+									dirty = true;
+									break;
+								}
+							}
+							
+							// Check remaining bytes
+							if (!dirty && (rowBytes % 8) != 0) {
+								size_t remaining = rowBytes % 8;
+								const uint8_t* prevTail = prevRow + (qwords * 8);
+								const uint8_t* currTail = currRow + (qwords * 8);
+								if (memcmp(prevTail, currTail, remaining) != 0) {
+									dirty = true;
+								}
 							}
 						}
 						if (dirty) {
@@ -1531,6 +1632,16 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		send(sktClient, (const char*)&nTilesNet, 4, 0);
 
 		size_t tileSeq = 0;
+		// Pre-allocate buffers outside the loop to reduce memory allocations
+		static std::vector<uint8_t> qoiDataBuffer;
+		static std::vector<uint8_t> xrleDataBuffer;
+		static std::vector<uint8_t> networkBuffer;
+		static constexpr size_t MAX_BATCH_SIZE = 64 * 1024; // 64KB batches for optimal network performance
+		
+		// Reserve space to minimize reallocations
+		qoiDataBuffer.reserve(TILE_W * TILE_H * 4);
+		xrleDataBuffer.reserve(TILE_W * TILE_H * 4 * 2);
+		
 		for (const auto& idx : DirtyTileIndices) {
 			int tx = idx.first, ty = idx.second;
 			int tileLeft = tx * TILE_W;
@@ -1544,39 +1655,35 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 				uint8_t* dst = tile.Bits() + row * tileW * 4;
 				memcpy(dst, src, tileW * 4);
 			}
-			std::vector<uint8_t> qoiData;
-			QOIEncodeBasicBitmap(&tile, qoiData);
+			
+			qoiDataBuffer.clear();
+			QOIEncodeBasicBitmap(&tile, qoiDataBuffer);
 
 			// Adaptive compression: skip XRLE for high FPS to reduce CPU overhead
-			std::vector<uint8_t> xrleData;
-			size_t xrleSize = qoiData.size();
+			size_t xrleSize = qoiDataBuffer.size();
 			int currentFps = g_streamingFps.load();
-			bool useDoubleCompression = (currentFps <= 30); // Only use XRLE for FPS <= 30
+			bool useDoubleCompression = (currentFps <= 40); // Increased threshold for better quality
 			
 			if (useDoubleCompression) {
-				xrleData.resize(std::max<size_t>(1, qoiData.size() * 2));
-				xrleSize = xrle_compress(xrleData.data(), qoiData.data(), qoiData.size());
-				xrleData.resize(xrleSize);
+				xrleDataBuffer.resize(std::max<size_t>(1, qoiDataBuffer.size() * 2));
+				xrleSize = xrle_compress(xrleDataBuffer.data(), qoiDataBuffer.data(), qoiDataBuffer.size());
+				xrleDataBuffer.resize(xrleSize);
 			} else {
 				// For high FPS, use QOI data directly to reduce compression overhead
-				xrleData = qoiData;
-				xrleSize = qoiData.size();
+				xrleDataBuffer = qoiDataBuffer;
+				xrleSize = qoiDataBuffer.size();
 			}
 
-			// Network batching: collect multiple tiles into a single buffer to reduce send() calls
-			static std::vector<uint8_t> networkBuffer;
-			static constexpr size_t MAX_BATCH_SIZE = 64 * 1024; // 64KB batches for optimal network performance
-			
 			// Prepare tile data for batching
 			uint32_t xNet = htonl(tileLeft);
 			uint32_t yNet = htonl(tileTop);
 			uint32_t wNet = htonl(tileW);
 			uint32_t hNet = htonl(tileH);
-			uint32_t xrleLenNet = htonl((uint32_t)xrleData.size());
-			uint32_t qoiOrigLenNet = htonl((uint32_t)qoiData.size());
+			uint32_t xrleLenNet = htonl((uint32_t)xrleDataBuffer.size());
+			uint32_t qoiOrigLenNet = htonl((uint32_t)qoiDataBuffer.size());
 			
 			// Calculate total size for this tile
-			size_t tilePacketSize = 24 + xrleData.size(); // 6 * 4 bytes headers + data
+			size_t tilePacketSize = 24 + xrleDataBuffer.size(); // 6 * 4 bytes headers + data
 			
 			// If adding this tile would exceed batch size, send current batch first
 			if (!networkBuffer.empty() && networkBuffer.size() + tilePacketSize > MAX_BATCH_SIZE) {
@@ -1599,13 +1706,13 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			memcpy(networkBuffer.data() + currentPos, &hNet, 4); currentPos += 4;
 			memcpy(networkBuffer.data() + currentPos, &xrleLenNet, 4); currentPos += 4;
 			memcpy(networkBuffer.data() + currentPos, &qoiOrigLenNet, 4); currentPos += 4;
-			memcpy(networkBuffer.data() + currentPos, xrleData.data(), xrleData.size());
+			memcpy(networkBuffer.data() + currentPos, xrleDataBuffer.data(), xrleDataBuffer.size());
 			
-			bytes += xrleData.size() + 24;
+			bytes += xrleDataBuffer.size() + 24;
 			tileSeq++;
 			
 			// Send batch if we're at the end of dirty tiles or batch is getting large
-			bool isLastTile = (tileSeq >= dirtyCount);
+			bool isLastTile = (tileSeq >= DirtyTileIndices.size());
 			bool shouldFlushBatch = (networkBuffer.size() >= MAX_BATCH_SIZE / 2) || isLastTile;
 			
 			if (shouldFlushBatch && !networkBuffer.empty()) {
@@ -3749,6 +3856,13 @@ int MainWindow::ListenThread()
 // New function: receive INPUT structs from each client and inject locally
 
 void ServerInputRecvThread(SOCKET clientSocket) {
+	// Set high thread priority for low-latency input processing
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	
+	// Optimize socket for low-latency input
+	int nodelay = 1;
+	setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+	
 	while (true) {
 		char buffer[sizeof(INPUT) > sizeof(RemoteCtrlMsg) ? sizeof(INPUT) : sizeof(RemoteCtrlMsg)];
 
@@ -3771,7 +3885,8 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 
 		if (received == sizeof(INPUT)) {
 			INPUT* inp = (INPUT*)buffer;
-			// DEBUG LOGGING: Print what is being injected
+			// Remove debug logging for better performance in production
+			#ifdef _DEBUG
 			if (inp->type == INPUT_KEYBOARD) {
 				std::cout << "[SERVER] Injecting INPUT: "
 					<< "VK=0x" << std::hex << (int)inp->ki.wVk
@@ -3782,6 +3897,8 @@ void ServerInputRecvThread(SOCKET clientSocket) {
 					<< ")"
 					<< std::dec << std::endl;
 			}
+			#endif
+			// Inject input immediately with minimal delay
 			SendInput(1, inp, sizeof(INPUT));
 		}
 	}
