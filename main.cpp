@@ -359,15 +359,24 @@ struct UltraFastDIBCache {
 	HGDIOBJ oldObj = NULL;
 	uint64_t lastUpdateTime = 0;
 	std::atomic<bool> inUse{false};
+	bool gdiSettingsApplied = false; // Track if GDI settings are already set
 	
 	bool PrepareForSize(int w, int h) {
-		if (width != w || height != h || !hBmp) {
+		// Only recreate if size differs by more than tolerance (avoids pixel-level flickering)
+		const int tolerance = 4; // Allow 4-pixel variance to reduce recreations
+		bool needsResize = (abs(width - w) > tolerance || abs(height - h) > tolerance || !hBmp);
+		
+		if (needsResize) {
 			Cleanup();
+			
+			// Allocate slightly larger buffer to reduce future recreations
+			int allocW = ((w + 63) / 64) * 64; // Round up to 64-pixel boundary  
+			int allocH = ((h + 63) / 64) * 64; // Round up to 64-pixel boundary
 			
 			BITMAPINFO bmi = {0};
 			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-			bmi.bmiHeader.biWidth = w;
-			bmi.bmiHeader.biHeight = -h; // Top-down DIB
+			bmi.bmiHeader.biWidth = allocW;
+			bmi.bmiHeader.biHeight = -allocH; // Top-down DIB
 			bmi.bmiHeader.biPlanes = 1;
 			bmi.bmiHeader.biBitCount = 32;
 			bmi.bmiHeader.biCompression = BI_RGB;
@@ -383,8 +392,17 @@ struct UltraFastDIBCache {
 			}
 			
 			oldObj = SelectObject(hMemDC, hBmp);
-			width = w;
-			height = h;
+			if (!oldObj) {
+				DeleteDC(hMemDC);
+				DeleteObject(hBmp);
+				hMemDC = NULL;
+				hBmp = NULL;
+				return false;
+			}
+			
+			width = allocW;
+			height = allocH;
+			gdiSettingsApplied = false; // Reset GDI settings when recreating
 		}
 		return true;
 	}
@@ -402,6 +420,7 @@ struct UltraFastDIBCache {
 			pBits = nullptr;
 		}
 		width = height = 0;
+		gdiSettingsApplied = false; // Reset flag on cleanup
 	}
 	
 	~UltraFastDIBCache() {
@@ -443,7 +462,7 @@ public:
 					currentJob.complete.store(true);
 					hasWork.store(false);
 				}
-				std::this_thread::sleep_for(std::chrono::microseconds(100)); // 10kHz polling
+				std::this_thread::sleep_for(std::chrono::milliseconds(1)); // 1kHz polling instead of 10kHz
 			}
 		});
 	}
@@ -749,7 +768,7 @@ void AudioStreamServerThreadXRLE(SOCKET clientSock) {
 	while (true) {
 		UINT32 packetLength = 0;
 		if (FAILED(captureClient->GetNextPacketSize(&packetLength))) break;
-		if (packetLength == 0) { Sleep(5); continue; }
+		if (packetLength == 0) { Sleep(10); continue; } // Reduce frequency from 5ms to 10ms
 
 		BYTE* pData;
 		UINT32 nFrames;
@@ -851,7 +870,7 @@ void AudioStreamClientThreadXRLE(const std::string& serverIp) {
 			pAudioClient->GetCurrentPadding(&padding);
 			UINT32 bufferFrameCountFree = bufferFrameCount - padding;
 			UINT32 chunk = std::min(framesToWrite, bufferFrameCountFree);
-			if (chunk == 0) { Sleep(5); continue; }
+			if (chunk == 0) { Sleep(10); continue; } // Reduce frequency from 5ms to 10ms
 
 			BYTE* pData = nullptr;
 			if (FAILED(pRenderClient->GetBuffer(chunk, &pData))) { break; }
@@ -1603,7 +1622,11 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			lastPrint = now;
 		}
 		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
-		if (elapsed < frameInterval) Sleep((DWORD)(frameInterval - elapsed));
+		// Use high-resolution timing instead of Sleep for better performance
+		if (elapsed < frameInterval) {
+			auto targetTime = start + milliseconds(frameInterval);
+			std::this_thread::sleep_until(targetTime);
+		}
 	}
 END:
 	closesocket(sktClient);
@@ -2030,9 +2053,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			int currentFps = g_streamingFps.load();
 			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
 			
-			if (currentTime - lastInvalidateTime < frameIntervalMs) {
-				// Skip this update to maintain synchronized frame rate
-				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate sync (target: %d FPS)\n", currentFps);
+			// Additional performance optimization: increase minimum interval for high CPU usage scenarios
+			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)16); // At most 60 FPS invalidation
+			
+			if (currentTime - lastInvalidateTime < minInterval) {
+				// Skip this update to maintain synchronized frame rate and reduce paint events
+				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate sync (target: %d FPS, min interval: %llu ms)\n", currentFps, minInterval);
 			}
 			else if (fullScreenInvalidation) {
 				InvalidateRect(hwnd, NULL, FALSE);
@@ -2679,9 +2705,12 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 					// Direct memory copy - no color conversion in paint handler!
 					memcpy(cache.pBits, frameData, srcW * srcH * 4);
 					
-					// Hardware-accelerated stretch with optimal mode
-					SetStretchBltMode(hdc, HALFTONE);
-					SetBrushOrgEx(hdc, 0, 0, NULL); // For HALFTONE mode
+					// Cache GDI settings to avoid repeated API calls (major performance gain)
+					if (!cache.gdiSettingsApplied) {
+						SetStretchBltMode(hdc, HALFTONE);
+						SetBrushOrgEx(hdc, 0, 0, NULL); // For HALFTONE mode
+						cache.gdiSettingsApplied = true;
+					}
 					
 					// Direct stretch from DIB to window - maximum performance
 					StretchBlt(hdc, offsetX, offsetY, drawW, drawH, 
