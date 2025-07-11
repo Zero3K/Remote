@@ -1923,164 +1923,125 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			invalidateRects.clear();
 
 			size_t receivedDirty = 0;
+			// Collect tile data first, then process in batch
+			struct TileUpdate {
+				uint32_t rx, ry, rw, rh;
+				std::unique_ptr<BasicBitmap> bitmap;
+			};
+			std::vector<TileUpdate> tileUpdates;
+			tileUpdates.reserve(128); // Pre-allocate for typical tile count
+			
 			for (size_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
 				if (!(dirtyBitmask[tileIdx / 8] & (1 << (tileIdx % 8))))
 					continue;
 
-				size_t tx = tileIdx % tiles_x;
-				size_t ty = tileIdx / tiles_x;
-				uint32_t x = static_cast<uint32_t>(tx * TILE_W);
-				uint32_t y = static_cast<uint32_t>(ty * TILE_H);
-				uint32_t w = std::min<uint32_t>(TILE_W, static_cast<uint32_t>(std::max(0, width - (int)x)));
-				uint32_t h = std::min<uint32_t>(TILE_H, static_cast<uint32_t>(std::max(0, height - (int)y)));
-
-				SRDPRINTF("ScreenRecvThread: expecting tile #%zu at grid (%zu,%zu) x=%u y=%u w=%u h=%u\n",
-					receivedDirty, tx, ty, x, y, w, h);
-
 				uint32_t rx, ry, rw, rh, xrleLen, qoiOrigLen;
-				if (recvn(skt, (char*)&rx, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rx failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				if (recvn(skt, (char*)&ry, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn ry failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				if (recvn(skt, (char*)&rw, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rw failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				if (recvn(skt, (char*)&rh, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn rh failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				if (recvn(skt, (char*)&xrleLen, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn xrleLen failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				if (recvn(skt, (char*)&qoiOrigLen, 4) != 4) { SRDPRINTF("ScreenRecvThread: recvn qoiOrigLen failed\n"); frame_error = true; lost_connection = true; running = false; break; }
-				bytesThisFrame += 4 * 6;
-				rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh); xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
-
-				SRDPRINTF("ScreenRecvThread: received header for tile #%zu: rx=%u ry=%u rw=%u rh=%u xrleLen=%u qoiOrigLen=%u\n",
-					receivedDirty, rx, ry, rw, rh, xrleLen, qoiOrigLen);
+				if (recvn(skt, (char*)&rx, 4) != 4 ||
+					recvn(skt, (char*)&ry, 4) != 4 ||
+					recvn(skt, (char*)&rw, 4) != 4 ||
+					recvn(skt, (char*)&rh, 4) != 4 ||
+					recvn(skt, (char*)&xrleLen, 4) != 4 ||
+					recvn(skt, (char*)&qoiOrigLen, 4) != 4) {
+					SRDPRINTF("ScreenRecvThread: recvn header failed\n");
+					frame_error = true; lost_connection = true; running = false; break;
+				}
+				bytesThisFrame += 24;
+				rx = ntohl(rx); ry = ntohl(ry); rw = ntohl(rw); rh = ntohl(rh);
+				xrleLen = ntohl(xrleLen); qoiOrigLen = ntohl(qoiOrigLen);
 
 				if (rw == 0 || rh == 0 || xrleLen == 0 || qoiOrigLen == 0) {
-					SRDPRINTF("ScreenRecvThread: zero/invalid header value, frame_error\n");
+					SRDPRINTF("ScreenRecvThread: invalid header\n");
 					frame_error = true; lost_connection = true; running = false; break;
 				}
 
 				std::vector<uint8_t> xrleData(xrleLen);
 				if (recvn(skt, (char*)xrleData.data(), xrleLen) != xrleLen) {
-					SRDPRINTF("ScreenRecvThread: recvn for xrleData failed\n");
+					SRDPRINTF("ScreenRecvThread: recvn data failed\n");
 					frame_error = true; lost_connection = true; running = false; break;
 				}
 				bytesThisFrame += xrleLen;
 
 				qoiData.resize(qoiOrigLen);
-				
-				// Adaptive decompression: check if data is double-compressed or QOI-only
 				if (xrleLen == qoiOrigLen) {
-					// High FPS mode: data is QOI-only (no XRLE compression)
 					memcpy(qoiData.data(), xrleData.data(), qoiOrigLen);
 				} else {
-					// Standard mode: data is XRLE-compressed QOI
 					size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
 					if (qoiLen != qoiOrigLen) {
-						SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
+						SRDPRINTF("ScreenRecvThread: decompress failed\n");
 						frame_error = true; lost_connection = true; running = false; break;
 					}
 				}
-				qoiData.resize(qoiOrigLen);
 
-				std::unique_ptr<BasicBitmap> tileBmp;
-				{
-					BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiLen);
-					if (!decoded) {
-						SRDPRINTF("ScreenRecvThread: QOIDecodeToBasicBitmap failed for tile #%zu\n", receivedDirty);
-						continue;
-					}
-					tileBmp.reset(decoded);
+				BasicBitmap* decoded = QOIDecodeToBasicBitmap(qoiData.data(), qoiOrigLen);
+				if (decoded) {
+					TileUpdate update;
+					update.rx = rx; update.ry = ry; update.rw = rw; update.rh = rh;
+					update.bitmap.reset(decoded);
+					tileUpdates.push_back(std::move(update));
 				}
-
-				// Ultra-fast frame update with lock-free design
+				receivedDirty++;
+			}
+			
+			// Process all tiles in single critical section with one color conversion
+			if (!tileUpdates.empty() && !frame_error) {
 				EnterCriticalSection(&bmpState->cs);
-				int needW = std::max(bmpState->imgW, (int)(rx + rw));
-				int needH = std::max(bmpState->imgH, (int)(ry + rh));
-				bool needRealloc = (bmpState->bmp == nullptr) || (bmpState->imgW != needW) || (bmpState->imgH != needH);
-				if (needRealloc) {
-					if (bmpState->bmp) delete bmpState->bmp;
-					bmpState->bmp = new BasicBitmap(needW, needH, BasicBitmap::A8R8G8B8);
-					bmpState->imgW = needW;
-					bmpState->imgH = needH;
+				
+				// Find required dimensions
+				int maxW = bmpState->imgW, maxH = bmpState->imgH;
+				for (const auto& tile : tileUpdates) {
+					maxW = std::max(maxW, (int)(tile.rx + tile.rw));
+					maxH = std::max(maxH, (int)(tile.ry + tile.rh));
 				}
 				
-				// Update the bitmap with tile data
-				for (uint32_t row = 0; row < rh; ++row) {
-					if ((ry + row) >= (uint32_t)bmpState->imgH || rx >= (uint32_t)bmpState->imgW) continue;
-					uint8_t* dst = bmpState->bmp->Bits() + ((ry + row) * bmpState->imgW + rx) * 4;
-					uint8_t* src = tileBmp->Bits() + row * rw * 4;
-					memcpy(dst, src, rw * 4);
+				// Reallocate if needed
+				if (!bmpState->bmp || bmpState->imgW != maxW || bmpState->imgH != maxH) {
+					delete bmpState->bmp;
+					bmpState->bmp = new BasicBitmap(maxW, maxH, BasicBitmap::A8R8G8B8);
+					bmpState->imgW = maxW; bmpState->imgH = maxH;
 				}
 				
-				// Track invalidation regions
-				if (rx == 0 && ry == 0 && rw == (uint32_t)bmpState->imgW && rh == (uint32_t)bmpState->imgH) {
-					fullScreenInvalidation = true;
-				}
-				else {
-					RECT tileRect;
-					tileRect.left = rx;
-					tileRect.top = ry;
-					tileRect.right = rx + rw;
-					tileRect.bottom = ry + rh;
-					invalidateRects.push_back(tileRect);
+				// Update all tiles
+				for (const auto& tile : tileUpdates) {
+					for (uint32_t row = 0; row < tile.rh; ++row) {
+						if ((tile.ry + row) >= (uint32_t)bmpState->imgH) continue;
+						uint8_t* dst = bmpState->bmp->Bits() + ((tile.ry + row) * bmpState->imgW + tile.rx) * 4;
+						uint8_t* src = tile.bitmap->Bits() + row * tile.rw * 4;
+						memcpy(dst, src, tile.rw * 4);
+					}
+					
+					if (tile.rx == 0 && tile.ry == 0 && tile.rw == (uint32_t)bmpState->imgW && tile.rh == (uint32_t)bmpState->imgH) {
+						fullScreenInvalidation = true;
+					} else {
+						RECT r = { (LONG)tile.rx, (LONG)tile.ry, (LONG)(tile.rx + tile.rw), (LONG)(tile.ry + tile.rh) };
+						invalidateRects.push_back(r);
+					}
 				}
 				
-				// Async color conversion and frame buffer update
-				uint8_t* srcData = bmpState->bmp->Bits();
-				int totalPixels = bmpState->imgW * bmpState->imgH;
-				
-				// Frame change detection using ultra-fast tile-based hash 
-				static uint64_t lastFrameHash = 0;
+				// **SINGLE** color conversion for entire frame (eliminates per-tile overhead)
 				static uint8_t* conversionBuffer = nullptr;
 				static size_t conversionBufferSize = 0;
-				static int skipConversionCounter = 0;
 				
-				// Ultra-fast hash - only sample 16 strategic pixels across the frame
-				uint64_t currentHash = 0;
-				const int width = bmpState->imgW;
-				const int height = bmpState->imgH;
-				const uint32_t* pixelData = (const uint32_t*)srcData;
+				uint8_t* srcData = bmpState->bmp->Bits();
+				int totalPixels = bmpState->imgW * bmpState->imgH;
+				size_t requiredSize = totalPixels * 4;
 				
-				// Sample from 4x4 grid of strategic locations
-				for (int y = 0; y < 4; y++) {
-					for (int x = 0; x < 4; x++) {
-						int pixelIndex = (y * height / 4) * width + (x * width / 4);
-						if (pixelIndex < totalPixels) {
-							currentHash = currentHash * 17 + pixelData[pixelIndex];
-						}
-					}
+				if (conversionBufferSize < requiredSize) {
+					delete[] conversionBuffer;
+					conversionBuffer = new uint8_t[requiredSize];
+					conversionBufferSize = requiredSize;
 				}
 				
-				// Only convert if frame content has changed or every 30 frames as a safety check
-				if (currentHash != lastFrameHash || (++skipConversionCounter >= 30)) {
-					lastFrameHash = currentHash;
-					skipConversionCounter = 0;
-					
-					size_t requiredSize = totalPixels * 4;
-					
-					if (conversionBufferSize < requiredSize) {
-						delete[] conversionBuffer;
-						conversionBuffer = new uint8_t[requiredSize];
-						conversionBufferSize = requiredSize;
-					}
-					
-					// Perform ultra-fast SIMD color conversion only when needed
-					if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
-						ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
-					} else {
-						// Fallback to scalar conversion if function pointer not initialized
-						ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
-					}
-					
-					// Update lock-free frame buffer - this never blocks the UI thread!
-					g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
-					
-					SRDPRINTF("ScreenRecvThread: Color conversion performed for tile #%zu (frame content changed)\n", receivedDirty);
+				if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
+					ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
 				} else {
-					SRDPRINTF("ScreenRecvThread: Skipped color conversion for tile #%zu (no frame change detected)\n", receivedDirty);
+					ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
 				}
+				
+				g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
 				
 				LeaveCriticalSection(&bmpState->cs);
-
-				SRDPRINTF("ScreenRecvThread: painted tile #%zu at %u,%u size %u,%u\n", receivedDirty, rx, ry, rw, rh);
-
-				receivedDirty++;
+				
+				SRDPRINTF("ScreenRecvThread: Batch processed %zu tiles\n", tileUpdates.size());
 			}
 			SRDPRINTF("ScreenRecvThread: received %zu dirty tiles for %zu dirty bits\n", receivedDirty, dirtyCount);
 
@@ -2718,64 +2679,30 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			break;
 		}
 
-		// Ultra-fast lock-free rendering
+		// High-performance rendering with minimized API calls
 		if (bmpState && bmpState->bmp) {
 			int srcW, srcH;
 			uint8_t* frameData;
 			uint64_t timestamp;
 			
-			// Lock-free frame access - never blocks!
 			if (g_frameBuffer.GetLatestFrame(srcW, srcH, frameData, timestamp)) {
-				// Calculate display dimensions with aspect ratio preservation
-				double srcAspect = (double)srcW / srcH;
-				double destAspect = (double)destW / destH;
-				int drawW, drawH, offsetX, offsetY;
-				
-				if (destAspect > srcAspect) {
-					drawH = destH;
-					drawW = (int)(drawH * srcAspect);
-					offsetX = (destW - drawW) / 2;
-					offsetY = 0;
-				} else {
-					drawW = destW;
-					drawH = (int)(drawW / srcAspect);
-					offsetX = 0;
-					offsetY = (destH - drawH) / 2;
-				}
-
-				// Ultra-fast DIB cache with direct memory access
 				auto& cache = g_ultraFastCache[hwnd];
 				if (cache.PrepareForSize(srcW, srcH) && cache.pBits) {
-					// Direct memory copy - no color conversion in paint handler!
+					// Direct memory copy (no color conversion here)
 					memcpy(cache.pBits, frameData, srcW * srcH * 4);
 					
-					// Cache GDI settings to avoid repeated API calls (major performance gain)
+					// One-time GDI setup (cached)
 					if (!cache.gdiSettingsApplied) {
 						SetStretchBltMode(hdc, HALFTONE);
-						SetBrushOrgEx(hdc, 0, 0, NULL); // For HALFTONE mode
+						SetBrushOrgEx(hdc, 0, 0, NULL);
 						cache.gdiSettingsApplied = true;
 					}
 					
-					// Direct stretch from DIB to window - maximum performance
-					StretchBlt(hdc, offsetX, offsetY, drawW, drawH, 
+					// Simple full-window stretch (maximum performance)
+					StretchBlt(hdc, 0, 0, destW, destH, 
 							  cache.hMemDC, 0, 0, srcW, srcH, SRCCOPY);
-					
-					cache.lastUpdateTime = timestamp;
-				} else {
-					// Fallback: fast black fill
-					HBRUSH blackBrush = (HBRUSH)GetStockObject(BLACK_BRUSH);
-					FillRect(hdc, &clientRect, blackBrush);
 				}
-			} else {
-				// No frame available: fast gray fill
-				HBRUSH grayBrush = CreateSolidBrush(RGB(64, 64, 64));
-				FillRect(hdc, &clientRect, grayBrush);
-				DeleteObject(grayBrush);
 			}
-		} else {
-			// No bitmap state: fast black fill
-			HBRUSH blackBrush = (HBRUSH)GetStockObject(BLACK_BRUSH);
-			FillRect(hdc, &clientRect, blackBrush);
 		}
 		
 		EndPaint(hwnd, &ps);
