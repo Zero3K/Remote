@@ -793,7 +793,7 @@ void AudioStreamServerThreadXRLE(SOCKET clientSock) {
 	while (true) {
 		UINT32 packetLength = 0;
 		if (FAILED(captureClient->GetNextPacketSize(&packetLength))) break;
-		if (packetLength == 0) { Sleep(10); continue; } // Reduce frequency from 5ms to 10ms
+		if (packetLength == 0) { Sleep(5); continue; } // Reduced back to 5ms for better audio responsiveness
 
 		BYTE* pData;
 		UINT32 nFrames;
@@ -895,7 +895,7 @@ void AudioStreamClientThreadXRLE(const std::string& serverIp) {
 			pAudioClient->GetCurrentPadding(&padding);
 			UINT32 bufferFrameCountFree = bufferFrameCount - padding;
 			UINT32 chunk = std::min(framesToWrite, bufferFrameCountFree);
-			if (chunk == 0) { Sleep(10); continue; } // Reduce frequency from 5ms to 10ms
+			if (chunk == 0) { Sleep(5); continue; } // Reduced back to 5ms for better audio responsiveness
 
 			BYTE* pData = nullptr;
 			if (FAILED(pRenderClient->GetBuffer(chunk, &pData))) { break; }
@@ -1618,6 +1618,21 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 						DirtyTileIndices.push_back({ (int)tx, (int)ty });
 					}
 			}
+		}
+
+		// Adaptive performance: Skip frame if too many dirty tiles to maintain responsiveness
+		const size_t MAX_TILES_PER_FRAME = 200; // Tune based on target performance
+		static int frameSkipCounter = 0;
+		
+		if (DirtyTileIndices.size() > MAX_TILES_PER_FRAME && fps > 15) {
+			frameSkipCounter++;
+			if (frameSkipCounter % 2 == 0) { // Skip every other frame when overloaded
+				// Still update the frame buffer for next comparison
+				prevBmp = std::make_unique<BasicBitmap>(*currBmp);
+				continue;
+			}
+		} else {
+			frameSkipCounter = 0; // Reset skip counter when load is manageable
 		}
 
 		std::vector<uint8_t> xrleBitmask(std::max<size_t>(1, dirtyBitmask.size() * 2));
