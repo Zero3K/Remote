@@ -1084,10 +1084,22 @@ const int nNormalized = 65535;
 bool CaptureScreenToBasicBitmap_GDI(BasicBitmap*& outBmp);
 
 // --- Capture screen to BasicBitmap, with automatic method selection (Direct2D or GDI) ---
+static BasicBitmap* g_lastCapturedFrame = nullptr; // Cache last successful frame for duplication
+
 bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	// Try Direct2D first if enabled
 	if (g_useDirect2DCapture) {
 		if (Direct2DCapture::CaptureScreenDirect2D(outBmp)) {
+			// Success: update cached frame
+			if (g_lastCapturedFrame) {
+				delete g_lastCapturedFrame;
+			}
+			g_lastCapturedFrame = new BasicBitmap(*outBmp); // Cache copy
+			return true;
+		}
+		// Direct2D failed - if we have a cached frame, duplicate it to maintain smooth playback
+		else if (g_lastCapturedFrame) {
+			outBmp = new BasicBitmap(*g_lastCapturedFrame);
 			return true;
 		}
 		// If Direct2D fails, fall back to GDI automatically (only log once)
@@ -1099,7 +1111,15 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	}
 	
 	// GDI fallback method (original implementation)
-	return CaptureScreenToBasicBitmap_GDI(outBmp);
+	bool result = CaptureScreenToBasicBitmap_GDI(outBmp);
+	if (result && outBmp) {
+		// Update cache even for GDI captures
+		if (g_lastCapturedFrame) {
+			delete g_lastCapturedFrame;
+		}
+		g_lastCapturedFrame = new BasicBitmap(*outBmp);
+	}
+	return result;
 }
 
 // --- GDI-based screen capture (renamed from original function) ---
@@ -1303,10 +1323,12 @@ namespace Direct2DCapture {
 		IDXGIResource* dxgiResource = nullptr;
 		DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
-		// Acquire next frame
-		hr = g_dxgiDuplication->AcquireNextFrame(0, &frameInfo, &dxgiResource);
+		// Acquire next frame with appropriate timeout for smooth streaming
+		// Use 16ms timeout (60 FPS) to avoid missing frames
+		hr = g_dxgiDuplication->AcquireNextFrame(16, &frameInfo, &dxgiResource);
 		if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-			// No new frame available, return previous frame or false
+			// No new frame available, but don't skip - return false to try again quickly
+			// This prevents frame dropping while maintaining responsiveness
 			return false;
 		}
 		if (FAILED(hr)) {
@@ -1790,7 +1812,11 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		auto start = steady_clock::now();
 
 		BasicBitmap* pBmp = nullptr;
-		if (!CaptureScreenToBasicBitmap(pBmp)) continue;
+		if (!CaptureScreenToBasicBitmap(pBmp)) {
+			// Brief yield to prevent tight loop when capture fails
+			std::this_thread::yield();
+			continue;
+		}
 		currBmp.reset(pBmp);
 		if (!currBmp) continue;
 
@@ -1806,7 +1832,8 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 		std::vector<std::pair<int, int>> DirtyTileIndices;
 
 		frameCounter++;
-		if (first || frameCounter % 60 == 0) {
+		// Reduce full refresh frequency for better responsiveness - only every 120 frames (4 seconds at 30fps)
+		if (first || frameCounter % 120 == 0) {
 			for (size_t ty = 0; ty < tiles_y; ++ty)
 				for (size_t tx = 0; tx < tiles_x; ++tx) {
 					size_t tidx = ty * tiles_x + tx;
@@ -2010,12 +2037,19 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			lastPrint = now;
 		}
 		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
-		// Use high-resolution timing with microsecond precision for smoother frame delivery
+		// Improved frame timing: use single sleep instead of spin loop to reduce CPU usage
 		if (elapsed < frameInterval) {
-			auto targetTime = start + milliseconds(frameInterval);
-			// Use precise timing to reduce frame jitter
-			while (steady_clock::now() < targetTime) {
-				std::this_thread::sleep_for(std::chrono::microseconds(100)); // 0.1ms sleep for precision
+			int sleepTime = frameInterval - elapsed;
+			if (sleepTime > 0) {
+				// Use Sleep() for larger intervals, then fine-tune with short wait
+				if (sleepTime > 2) {
+					Sleep(sleepTime - 1); // Sleep most of the time
+				}
+				// Fine-tune the remaining time with high precision
+				auto targetTime = start + milliseconds(frameInterval);
+				while (steady_clock::now() < targetTime) {
+					std::this_thread::yield(); // More efficient than microsecond sleep
+				}
 			}
 		}
 	}
@@ -2424,11 +2458,11 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			int currentFps = g_streamingFps.load();
 			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
 			
-			// Additional performance optimization: increase minimum interval for high CPU usage scenarios
-			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)8); // Allow up to 120 FPS invalidation for smoother experience
+			// Reduced minimum interval restriction for better responsiveness
+			uint64_t minInterval = std::max(frameIntervalMs / 2, (uint64_t)4); // Allow up to 250 FPS invalidation for maximum responsiveness
 			
 			if (shouldCheckTiming && (currentTime - lastInvalidateTime < minInterval)) {
-				// Skip this update to maintain synchronized frame rate and reduce paint events
+				// Skip this update to maintain synchronized frame rate, but be less restrictive
 				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate sync (target: %d FPS, min interval: %llu ms)\n", currentFps, minInterval);
 			}
 			else if (fullScreenInvalidation) {
@@ -2470,21 +2504,21 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				static int congestionCounter = 0;
 				avgMbps = (avgMbps * 0.8) + (mbps * 0.2); // Exponential moving average
 				
-				// Detect network congestion and recommend FPS adjustment  
-				bool networkCongested = (avgMbps > 150.0 && framesLastSec < g_streamingFps.load() * 0.6); // Increased threshold and made less sensitive
+				// Network congestion detection: much less aggressive to preserve user-selected FPS
+				bool networkCongested = (avgMbps > 200.0 && framesLastSec < g_streamingFps.load() * 0.4); // Further increased threshold
 				if (networkCongested) {
 					congestionCounter++;
-					if (congestionCounter >= 7) { // Increased from 5 to 7 seconds to be much less aggressive
+					if (congestionCounter >= 15) { // Much longer wait (15 seconds) before adjusting
 						int currentFps = g_streamingFps.load();
-						if (currentFps > 40) { // Only reduce FPS if above 40 to preserve 30 FPS setting
+						if (currentFps > 60) { // Only reduce FPS if above 60 to preserve 30 FPS setting
 							// Automatically reduce FPS to improve stability
-							g_streamingFps.store(std::max(30, currentFps - 5)); // Reduce by smaller increments (5 instead of 10)
-							std::cout << "🌐 Network congestion detected, reducing FPS to " << g_streamingFps.load() << std::endl;
+							g_streamingFps.store(std::max(30, currentFps - 10)); // Larger reduction when we do adjust
+							std::cout << "🌐 Severe network congestion detected, reducing FPS to " << g_streamingFps.load() << std::endl;
 						}
 						congestionCounter = 0;
 					}
 				} else {
-					congestionCounter = std::max(0, congestionCounter - 1);
+					congestionCounter = std::max(0, congestionCounter - 2); // Faster recovery
 				}
 				
 				RECT clientRect;
