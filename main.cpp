@@ -431,12 +431,14 @@ struct UltraFastDIBCache {
 static std::unordered_map<HWND, UltraFastDIBCache> g_ultraFastCache;
 static LockFreeFrameBuffer g_frameBuffer;
 
-// Async color conversion worker
+// Optimized color conversion worker with condition variables
 class AsyncColorConverter {
 private:
 	std::thread workerThread;
 	std::atomic<bool> shouldExit{false};
 	std::atomic<bool> hasWork{false};
+	std::mutex jobMutex;
+	std::condition_variable jobCondition;
 	
 	struct ConversionJob {
 		const uint8_t* src;
@@ -451,6 +453,11 @@ public:
 	AsyncColorConverter() {
 		workerThread = std::thread([this]() {
 			while (!shouldExit.load()) {
+				std::unique_lock<std::mutex> lock(jobMutex);
+				jobCondition.wait(lock, [this] { return hasWork.load() || shouldExit.load(); });
+				
+				if (shouldExit.load()) break;
+				
 				if (hasWork.load()) {
 					// Perform SIMD-optimized conversion
 					if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
@@ -462,7 +469,6 @@ public:
 					currentJob.complete.store(true);
 					hasWork.store(false);
 				}
-				std::this_thread::sleep_for(std::chrono::milliseconds(1)); // 1kHz polling instead of 10kHz
 			}
 		});
 	}
@@ -475,6 +481,9 @@ public:
 		currentJob.pixelCount = pixelCount;
 		currentJob.complete.store(false);
 		hasWork.store(true);
+		
+		// Wake up the worker thread
+		jobCondition.notify_one();
 		return true;
 	}
 	
@@ -484,6 +493,7 @@ public:
 	
 	~AsyncColorConverter() {
 		shouldExit.store(true);
+		jobCondition.notify_all();
 		if (workerThread.joinable()) {
 			workerThread.join();
 		}
@@ -2015,27 +2025,56 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				uint8_t* srcData = bmpState->bmp->Bits();
 				int totalPixels = bmpState->imgW * bmpState->imgH;
 				
-				// Allocate conversion buffer (reused for efficiency)
+				// Frame change detection using ultra-fast tile-based hash 
+				static uint64_t lastFrameHash = 0;
 				static uint8_t* conversionBuffer = nullptr;
 				static size_t conversionBufferSize = 0;
-				size_t requiredSize = totalPixels * 4;
+				static int skipConversionCounter = 0;
 				
-				if (conversionBufferSize < requiredSize) {
-					delete[] conversionBuffer;
-					conversionBuffer = new uint8_t[requiredSize];
-					conversionBufferSize = requiredSize;
+				// Ultra-fast hash - only sample 16 strategic pixels across the frame
+				uint64_t currentHash = 0;
+				const int width = bmpState->imgW;
+				const int height = bmpState->imgH;
+				const uint32_t* pixelData = (const uint32_t*)srcData;
+				
+				// Sample from 4x4 grid of strategic locations
+				for (int y = 0; y < 4; y++) {
+					for (int x = 0; x < 4; x++) {
+						int pixelIndex = (y * height / 4) * width + (x * width / 4);
+						if (pixelIndex < totalPixels) {
+							currentHash = currentHash * 17 + pixelData[pixelIndex];
+						}
+					}
 				}
 				
-				// Perform ultra-fast SIMD color conversion
-				if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
-					ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
+				// Only convert if frame content has changed or every 30 frames as a safety check
+				if (currentHash != lastFrameHash || (++skipConversionCounter >= 30)) {
+					lastFrameHash = currentHash;
+					skipConversionCounter = 0;
+					
+					size_t requiredSize = totalPixels * 4;
+					
+					if (conversionBufferSize < requiredSize) {
+						delete[] conversionBuffer;
+						conversionBuffer = new uint8_t[requiredSize];
+						conversionBufferSize = requiredSize;
+					}
+					
+					// Perform ultra-fast SIMD color conversion only when needed
+					if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
+						ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
+					} else {
+						// Fallback to scalar conversion if function pointer not initialized
+						ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
+					}
+					
+					// Update lock-free frame buffer - this never blocks the UI thread!
+					g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
+					
+					SRDPRINTF("ScreenRecvThread: Color conversion performed for tile #%zu (frame content changed)\n", receivedDirty);
 				} else {
-					// Fallback to scalar conversion if function pointer not initialized
-					ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
+					SRDPRINTF("ScreenRecvThread: Skipped color conversion for tile #%zu (no frame change detected)\n", receivedDirty);
 				}
-				
-				// Update lock-free frame buffer - this never blocks the UI thread!
-				g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
 				
 				LeaveCriticalSection(&bmpState->cs);
 
@@ -2045,24 +2084,29 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			}
 			SRDPRINTF("ScreenRecvThread: received %zu dirty tiles for %zu dirty bits\n", receivedDirty, dirtyCount);
 
-			// Ultra-fast invalidation: Use simple bounding rectangle instead of complex regions
+			// Optimized invalidation: reduce Windows API calls for better performance
 			static uint64_t lastInvalidateTime = 0;
-			uint64_t currentTime = GetTickCount64();
+			static int frameCounter = 0;
+			frameCounter++;
+			
+			// Only check timing every 4th frame to reduce GetTickCount64 overhead
+			bool shouldCheckTiming = (frameCounter % 4 == 0);
+			uint64_t currentTime = shouldCheckTiming ? GetTickCount64() : lastInvalidateTime + 50;
 			
 			// Synchronized frame rate limiting: match capture FPS instead of hardcoded 60 FPS
 			int currentFps = g_streamingFps.load();
 			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
 			
 			// Additional performance optimization: increase minimum interval for high CPU usage scenarios
-			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)16); // At most 60 FPS invalidation
+			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)33); // At most 30 FPS invalidation
 			
-			if (currentTime - lastInvalidateTime < minInterval) {
+			if (shouldCheckTiming && (currentTime - lastInvalidateTime < minInterval)) {
 				// Skip this update to maintain synchronized frame rate and reduce paint events
 				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate sync (target: %d FPS, min interval: %llu ms)\n", currentFps, minInterval);
 			}
 			else if (fullScreenInvalidation) {
 				InvalidateRect(hwnd, NULL, FALSE);
-				lastInvalidateTime = currentTime;
+				if (shouldCheckTiming) lastInvalidateTime = currentTime;
 				SRDPRINTF("ScreenRecvThread: InvalidateRect(NULL)\n");
 			}
 			else if (!invalidateRects.empty()) {
@@ -2078,7 +2122,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				
 				// Single invalidation call - maximum efficiency
 				InvalidateRect(hwnd, &boundingRect, FALSE);
-				lastInvalidateTime = currentTime;
+				if (shouldCheckTiming) lastInvalidateTime = currentTime;
 				
 				SRDPRINTF("ScreenRecvThread: Ultra-fast InvalidateRect with %zu tiles\n", invalidateRects.size());
 			}
