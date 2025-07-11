@@ -202,26 +202,37 @@ namespace ColorConversion {
 	}
 }
 
-// Performance monitoring structure
+// Enhanced performance monitoring structure
 struct PerformanceMonitor {
 	std::chrono::steady_clock::time_point lastUpdate;
 	int frameCount = 0;
 	double avgPaintTime = 0.0;
 	double avgConversionTime = 0.0;
+	double avgCompressionTime = 0.0;
+	double avgNetworkBatchSize = 0.0;
+	int compressionSkipCount = 0;
 	
-	void RecordFrame(double paintTimeMs, double conversionTimeMs) {
+	void RecordFrame(double paintTimeMs, double conversionTimeMs, double compressionTimeMs = 0.0, double batchSizeKB = 0.0, bool compressionSkipped = false) {
 		frameCount++;
 		avgPaintTime = (avgPaintTime * (frameCount - 1) + paintTimeMs) / frameCount;
 		avgConversionTime = (avgConversionTime * (frameCount - 1) + conversionTimeMs) / frameCount;
+		avgCompressionTime = (avgCompressionTime * (frameCount - 1) + compressionTimeMs) / frameCount;
+		avgNetworkBatchSize = (avgNetworkBatchSize * (frameCount - 1) + batchSizeKB) / frameCount;
+		if (compressionSkipped) compressionSkipCount++;
 		
 		auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdate).count() >= 5) {
-			std::cout << "Performance: " << frameCount << " frames, avg paint: " << avgPaintTime 
-					  << "ms, avg conversion: " << avgConversionTime << "ms" << std::endl;
+			std::cout << "🚀 Performance Report: " << frameCount << " frames" << std::endl;
+			std::cout << "   📊 Paint: " << avgPaintTime << "ms, Conversion: " << avgConversionTime << "ms" << std::endl;
+			std::cout << "   🗜️  Compression: " << avgCompressionTime << "ms (" << compressionSkipCount << " skipped)" << std::endl;
+			std::cout << "   📡 Network batch: " << avgNetworkBatchSize << "KB avg" << std::endl;
 			lastUpdate = now;
 			frameCount = 0;
 			avgPaintTime = 0.0;
 			avgConversionTime = 0.0;
+			avgCompressionTime = 0.0;
+			avgNetworkBatchSize = 0.0;
+			compressionSkipCount = 0;
 		}
 	}
 };
@@ -335,6 +346,9 @@ struct LockFreeFrameBuffer {
 		}
 	}
 };
+
+// Global performance monitor instance
+static PerformanceMonitor g_perfMonitor;
 
 // Ultra-fast DIB cache with direct memory mapping
 struct UltraFastDIBCache {
@@ -1504,32 +1518,76 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			std::vector<uint8_t> qoiData;
 			QOIEncodeBasicBitmap(&tile, qoiData);
 
-			std::vector<uint8_t> xrleData(std::max<size_t>(1, qoiData.size() * 2));
-			size_t xrleSize = xrle_compress(xrleData.data(), qoiData.data(), qoiData.size());
-			xrleData.resize(xrleSize);
+			// Adaptive compression: skip XRLE for high FPS to reduce CPU overhead
+			std::vector<uint8_t> xrleData;
+			size_t xrleSize = qoiData.size();
+			int currentFps = g_streamingFps.load();
+			bool useDoubleCompression = (currentFps <= 30); // Only use XRLE for FPS <= 30
+			
+			if (useDoubleCompression) {
+				xrleData.resize(std::max<size_t>(1, qoiData.size() * 2));
+				xrleSize = xrle_compress(xrleData.data(), qoiData.data(), qoiData.size());
+				xrleData.resize(xrleSize);
+			} else {
+				// For high FPS, use QOI data directly to reduce compression overhead
+				xrleData = qoiData;
+				xrleSize = qoiData.size();
+			}
 
+			// Network batching: collect multiple tiles into a single buffer to reduce send() calls
+			static std::vector<uint8_t> networkBuffer;
+			static constexpr size_t MAX_BATCH_SIZE = 64 * 1024; // 64KB batches for optimal network performance
+			
+			// Prepare tile data for batching
 			uint32_t xNet = htonl(tileLeft);
 			uint32_t yNet = htonl(tileTop);
 			uint32_t wNet = htonl(tileW);
 			uint32_t hNet = htonl(tileH);
 			uint32_t xrleLenNet = htonl((uint32_t)xrleData.size());
 			uint32_t qoiOrigLenNet = htonl((uint32_t)qoiData.size());
-
-			send(sktClient, (const char*)&xNet, 4, 0);
-			send(sktClient, (const char*)&yNet, 4, 0);
-			send(sktClient, (const char*)&wNet, 4, 0);
-			send(sktClient, (const char*)&hNet, 4, 0);
-			send(sktClient, (const char*)&xrleLenNet, 4, 0);
-			send(sktClient, (const char*)&qoiOrigLenNet, 4, 0);
-
-			size_t offset = 0;
-			while (offset < xrleData.size()) {
-				int sent = send(sktClient, (const char*)(xrleData.data() + offset), xrleData.size() - offset, 0);
-				if (sent <= 0) goto END;
-				offset += sent;
+			
+			// Calculate total size for this tile
+			size_t tilePacketSize = 24 + xrleData.size(); // 6 * 4 bytes headers + data
+			
+			// If adding this tile would exceed batch size, send current batch first
+			if (!networkBuffer.empty() && networkBuffer.size() + tilePacketSize > MAX_BATCH_SIZE) {
+				size_t offset = 0;
+				while (offset < networkBuffer.size()) {
+					int sent = send(sktClient, (const char*)(networkBuffer.data() + offset), networkBuffer.size() - offset, 0);
+					if (sent <= 0) goto END;
+					offset += sent;
+				}
+				networkBuffer.clear();
 			}
+			
+			// Add tile to batch buffer
+			size_t currentPos = networkBuffer.size();
+			networkBuffer.resize(currentPos + tilePacketSize);
+			
+			memcpy(networkBuffer.data() + currentPos, &xNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, &yNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, &wNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, &hNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, &xrleLenNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, &qoiOrigLenNet, 4); currentPos += 4;
+			memcpy(networkBuffer.data() + currentPos, xrleData.data(), xrleData.size());
+			
 			bytes += xrleData.size() + 24;
 			tileSeq++;
+			
+			// Send batch if we're at the end of dirty tiles or batch is getting large
+			bool isLastTile = (tileSeq >= dirtyCount);
+			bool shouldFlushBatch = (networkBuffer.size() >= MAX_BATCH_SIZE / 2) || isLastTile;
+			
+			if (shouldFlushBatch && !networkBuffer.empty()) {
+				size_t offset = 0;
+				while (offset < networkBuffer.size()) {
+					int sent = send(sktClient, (const char*)(networkBuffer.data() + offset), networkBuffer.size() - offset, 0);
+					if (sent <= 0) goto END;
+					offset += sent;
+				}
+				networkBuffer.clear();
+			}
 		}
 		prevBmp = std::make_unique<BasicBitmap>(*currBmp);
 
@@ -1872,12 +1930,20 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				bytesThisFrame += xrleLen;
 
 				qoiData.resize(qoiOrigLen);
-				size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
-				if (qoiLen != qoiOrigLen) {
-					SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
-					frame_error = true; lost_connection = true; running = false; break;
+				
+				// Adaptive decompression: check if data is double-compressed or QOI-only
+				if (xrleLen == qoiOrigLen) {
+					// High FPS mode: data is QOI-only (no XRLE compression)
+					memcpy(qoiData.data(), xrleData.data(), qoiOrigLen);
+				} else {
+					// Standard mode: data is XRLE-compressed QOI
+					size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
+					if (qoiLen != qoiOrigLen) {
+						SRDPRINTF("ScreenRecvThread: xrle_decompress qoiLen=%zu != qoiOrigLen=%u\n", qoiLen, qoiOrigLen);
+						frame_error = true; lost_connection = true; running = false; break;
+					}
 				}
-				qoiData.resize(qoiLen);
+				qoiData.resize(qoiOrigLen);
 
 				std::unique_ptr<BasicBitmap> tileBmp;
 				{
@@ -1960,10 +2026,13 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			static uint64_t lastInvalidateTime = 0;
 			uint64_t currentTime = GetTickCount64();
 			
-			// Frame rate limiting: cap at 60 FPS (16.67ms intervals) to prevent excessive redraws
-			if (currentTime - lastInvalidateTime < 16) {
-				// Skip this update to maintain frame rate cap
-				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate limiting\n");
+			// Synchronized frame rate limiting: match capture FPS instead of hardcoded 60 FPS
+			int currentFps = g_streamingFps.load();
+			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
+			
+			if (currentTime - lastInvalidateTime < frameIntervalMs) {
+				// Skip this update to maintain synchronized frame rate
+				SRDPRINTF("ScreenRecvThread: Skipping update for frame rate sync (target: %d FPS)\n", currentFps);
 			}
 			else if (fullScreenInvalidation) {
 				InvalidateRect(hwnd, NULL, FALSE);
@@ -1998,15 +2067,39 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			auto now = steady_clock::now();
 			if (duration_cast<seconds>(now - lastSec).count() >= 1) {
 				double mbps = (bytesLastSec * 8.0) / 1e6;
+				
+				// Network congestion detection and adaptive quality
+				static double avgMbps = 0.0;
+				static int congestionCounter = 0;
+				avgMbps = (avgMbps * 0.8) + (mbps * 0.2); // Exponential moving average
+				
+				// Detect network congestion and recommend FPS adjustment
+				bool networkCongested = (avgMbps > 50.0 && framesLastSec < g_streamingFps.load() * 0.8);
+				if (networkCongested) {
+					congestionCounter++;
+					if (congestionCounter >= 3) { // 3 seconds of congestion
+						int currentFps = g_streamingFps.load();
+						if (currentFps > 20) {
+							// Automatically reduce FPS to improve stability
+							g_streamingFps.store(std::max(20, currentFps - 10));
+							std::cout << "🌐 Network congestion detected, reducing FPS to " << g_streamingFps.load() << std::endl;
+						}
+						congestionCounter = 0;
+					}
+				} else {
+					congestionCounter = std::max(0, congestionCounter - 1);
+				}
+				
 				RECT clientRect;
 				GetClientRect(hwnd, &clientRect);
 				int winW = clientRect.right - clientRect.left;
 				int winH = clientRect.bottom - clientRect.top;
 				char title[256];
-				snprintf(title, sizeof(title), "Remote Screen | IP: %s | Port: %d | FPS: %d | Mbps: %.2f | Size: %dx%d",
-					last_ip.c_str(), last_port, framesLastSec, mbps, winW, winH);
+				const char* qualityIndicator = networkCongested ? "🔴" : (avgMbps < 10.0 ? "🟢" : "🟡");
+				snprintf(title, sizeof(title), "Remote Screen %s | IP: %s | Port: %d | FPS: %d | Mbps: %.2f | Size: %dx%d",
+					qualityIndicator, last_ip.c_str(), last_port, framesLastSec, mbps, winW, winH);
 				PostMessage(hwnd, WM_USER + 2, 0, (LPARAM)title);
-				SRDPRINTF("ScreenRecvThread: Updated window title\n");
+				SRDPRINTF("ScreenRecvThread: Updated window title (quality: %s, avg: %.2f Mbps)\n", qualityIndicator, avgMbps);
 				bytesLastSec = 0;
 				framesLastSec = 0;
 				lastSec = now;
