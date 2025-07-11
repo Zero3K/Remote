@@ -254,7 +254,7 @@ public:
 			available.pop_back();
 			return bmp;
 		}
-		return new BasicBitmap(width, height, BasicBitmap::PixelFmt::A8R8G8B8);
+		return new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
 	}
 	
 	void Release(BasicBitmap* bmp) {
@@ -680,7 +680,7 @@ void detect_dirty_tiles(
 // Extract a tile from a source RGBA buffer into a new BasicBitmap
 BasicBitmap* extract_tile_basicbitmap(const uint8_t* rgba, int width, int height, const DirtyTile& r) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
-	BasicBitmap* tile = new BasicBitmap(rw, rh, BasicBitmap::PixelFmt::A8R8G8B8);
+	BasicBitmap* tile = new BasicBitmap(rw, rh, BasicBitmap::A8R8G8B8);
 	for (int row = 0; row < rh; ++row) {
 		const uint8_t* src = rgba + ((r.top + row) * width + r.left) * 4;
 		uint8_t* dst = tile->Bits() + row * rw * 4;
@@ -694,7 +694,7 @@ bool QOIEncodeSubimage_BasicBitmap(
 	const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& outQoi
 ) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
-	BasicBitmap tile(rw, rh, BasicBitmap::PixelFmt::A8R8G8B8);
+	BasicBitmap tile(rw, rh, BasicBitmap::A8R8G8B8);
 
 	for (int row = 0; row < rh; ++row) {
 		const uint8_t* src = &rgba[((r.top + row) * width + r.left) * 4];
@@ -1058,7 +1058,7 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	DeleteDC(hMemDC);
 	ReleaseDC(NULL, hScreenDC);
 
-	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::PixelFmt::A8R8G8B8);
+	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
 	uint8_t* src = static_cast<uint8_t*>(pBits);
 	uint8_t* dst = bmp->Bits();
 	for (int i = 0; i < width * height; ++i) {
@@ -1129,7 +1129,7 @@ BasicBitmap* QOIDecodeToBasicBitmap(const uint8_t* data, size_t len) {
 	qoi_desc desc;
 	uint8_t* decoded = (uint8_t*)qoi_decode(data, len, &desc, 4);
 	if (!decoded) return nullptr;
-	BasicBitmap* bmp = new BasicBitmap(desc.width, desc.height, BasicBitmap::PixelFmt::A8R8G8B8);
+	BasicBitmap* bmp = new BasicBitmap(desc.width, desc.height, BasicBitmap::A8R8G8B8);
 	memcpy(bmp->Bits(), decoded, desc.width * desc.height * 4);
 	free(decoded);
 	return bmp;
@@ -1538,7 +1538,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			int tileW = std::min(TILE_W, width - tileLeft);
 			int tileH = std::min(TILE_H, height - tileTop);
 
-			BasicBitmap tile(tileW, tileH, BasicBitmap::PixelFmt::A8R8G8B8);
+			BasicBitmap tile(tileW, tileH, BasicBitmap::A8R8G8B8);
 			for (int row = 0; row < tileH; ++row) {
 				const uint8_t* src = curr_rgba + ((tileTop + row) * width + tileLeft) * 4;
 				uint8_t* dst = tile.Bits() + row * tileW * 4;
@@ -1996,7 +1996,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				// Reallocate if needed
 				if (!bmpState->bmp || bmpState->imgW != maxW || bmpState->imgH != maxH) {
 					delete bmpState->bmp;
-					bmpState->bmp = new BasicBitmap(maxW, maxH, BasicBitmap::PixelFmt::A8R8G8B8);
+					bmpState->bmp = new BasicBitmap(maxW, maxH, BasicBitmap::A8R8G8B8);
 					bmpState->imgW = maxW; bmpState->imgH = maxH;
 				}
 				

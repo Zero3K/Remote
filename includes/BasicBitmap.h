@@ -543,7 +543,7 @@ public:
 	virtual ~BasicBitmap();
 
 	// format of color elements
-	enum class PixelFmt { 
+	enum PixelFmt { 
 		A8R8G8B8 = 0, 
 		A8B8G8R8 = 1,
 		X8R8G8B8 = 2, 
@@ -557,7 +557,7 @@ public:
 	};
 	
 	// create new bitmap, default pixel format is A8R8G8B8 
-	BasicBitmap(int width, int height, PixelFmt fmt = PixelFmt::A8R8G8B8);
+	BasicBitmap(int width, int height, PixelFmt fmt = A8R8G8B8);
 
 	// create new bitmap with external bit buffer, 
 	// you must free external mem manually after destructor
@@ -624,7 +624,7 @@ public:
 		const BasicBitmap *B, const BasicBitmap *A);
 
 	// chop a rectangle and make a new bitmap,
-	BasicBitmap *Chop(int x, int y, int w, int h, PixelFmt fmt = PixelFmt::A8R8G8B8);
+	BasicBitmap *Chop(int x, int y, int w, int h, PixelFmt fmt = A8R8G8B8);
 
 	// flip around y axis 
 	void FlipHorizontal();
