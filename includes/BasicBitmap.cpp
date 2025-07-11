@@ -12,7 +12,7 @@
 // 
 // FEATURES:
 //
-//  - common pixel format supported (from A8R8G8B8 to A4R4G4B4)
+//  - common pixel format supported (from PixelFmt::A8PixelFmt::R8G8B8 to A4R4G4B4)
 //  - blitting with or without a transparent color
 //  - converting between different pixel formats
 //  - loading bmp/tga from memory or file and saving bmp to file
@@ -32,8 +32,8 @@
 //  - Convert: convert from different pixel-format
 //  - SetPixel: draw pixel in raw color
 //  - GetPixel: read pixel in raw color
-//  - SetColor: draw pixel in A8R8G8B8
-//  - GetColor: read pixel in A8R8G8B8
+//  - SetColor: draw pixel in PixelFmt::A8R8G8B8
+//  - GetColor: read pixel in PixelFmt::A8R8G8B8
 //  - Scale: scale bitmap using different filter and blend op
 //  - DrawLine: draw a line
 //  - QuickText: draw text with internal mini-8x8 ascii font
@@ -314,13 +314,13 @@ void PixelInitLut()
 //---------------------------------------------------------------------
 // Internal Macros
 //---------------------------------------------------------------------
-#define RGBA_FROM_A8R8G8B8(c, r, g, b, a) _pixel_disasm_8888(c, a, r, g, b)
-#define RGBA_FROM_X8R8G8B8(c, r, g, b, a) do { \
+#define RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(c, r, g, b, a) _pixel_disasm_8888(c, a, r, g, b)
+#define RGBA_FROM_PixelFmt::X8PixelFmt::R8G8B8(c, r, g, b, a) do { \
         _pixel_disasm_X888(c, r, g, b); (a) = 255; } while (0)
-#define RGBA_FROM_P8R8G8B8(c, r, g, b, a) do { \
-        _pixel_from_P8R8G8B8(c, r, g, b, a); } while (0)
+#define RGBA_FROM_P8PixelFmt::R8G8B8(c, r, g, b, a) do { \
+        _pixel_from_P8PixelFmt::R8G8B8(c, r, g, b, a); } while (0)
 #define RGBA_FROM_A8B8G8R8(c, r, g, b, a) _pixel_disasm_8888(c, a, b, g, r)
-#define RGBA_FROM_R8G8B8(c, r, g, b, a) do { \
+#define RGBA_FROM_PixelFmt::R8G8B8(c, r, g, b, a) do { \
         _pixel_disasm_888(c, r, g, b); (a) = 255; } while (0)
 #define RGBA_FROM_R5G6B5(c, r, g, b, a) do { \
         _pixel_disasm_565(c, r, g, b); (a) = 255; } while (0)
@@ -331,11 +331,11 @@ void PixelInitLut()
 #define RGBA_FROM_G8(c, r, g, b, a) do { \
 		(r) = (g) = (b) = (c); (a) = 255; } while (0)
 
-#define RGBA_TO_A8R8G8B8(r, g, b, a)  _pixel_asm_8888(a, r, g, b)
+#define RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r, g, b, a)  _pixel_asm_8888(a, r, g, b)
 #define RGBA_TO_A8B8G8R8(r, g, b, a)  _pixel_asm_8888(a, b, g, r)
-#define RGBA_TO_X8R8G8B8(r, g, b, a)  _pixel_asm_8888(0, r, g, b)
-#define RGBA_TO_P8R8G8B8(r, g, b, a)  _pixel_RGBA_to_P8R8G8B8(r, g, b, a)
-#define RGBA_TO_R8G8B8(r, g, b, a)    _pixel_asm_888(r, g, b)
+#define RGBA_TO_PixelFmt::X8PixelFmt::R8G8B8(r, g, b, a)  _pixel_asm_8888(0, r, g, b)
+#define RGBA_TO_P8PixelFmt::R8G8B8(r, g, b, a)  _pixel_RGBA_to_P8PixelFmt::R8G8B8(r, g, b, a)
+#define RGBA_TO_PixelFmt::R8G8B8(r, g, b, a)    _pixel_asm_888(r, g, b)
 #define RGBA_TO_R5G6B5(r, g, b, a)    _pixel_asm_565(r, g, b)
 #define RGBA_TO_X1R5G5B5(r, g, b, a)  _pixel_asm_1555(0, r, g, b)
 #define RGBA_TO_A1R5G5B5(r, g, b, a)  _pixel_asm_1555(a, r, g, b)
@@ -343,13 +343,13 @@ void PixelInitLut()
 #define RGBA_TO_G8(r, g, b, a)        _pixel_to_gray(r, g, b)
 
 
-#define _pixel_RGBA_to_P8R8G8B8(r, g, b, a) ( \
+#define _pixel_RGBA_to_P8PixelFmt::R8G8B8(r, g, b, a) ( \
         (((a)) << 24) | \
         ((((r) * _pixel_norm(a)) >> 8) << 16) | \
         ((((g) * _pixel_norm(a)) >> 8) <<  8) | \
         ((((b) * _pixel_norm(a)) >> 8) <<  0))
 
-#define _pixel_from_P8R8G8B8(c, r, g, b, a) do { \
+#define _pixel_from_P8PixelFmt::R8G8B8(c, r, g, b, a) do { \
             IUINT32 __SA = ((c) >> 24); \
             IUINT32 __FA = (__SA); \
             (a) = __SA; \
@@ -509,8 +509,8 @@ BasicBitmap::PixelBlit BasicBitmap::PixelBlitMask4 = NULL;
 
 //---------------------------------------------------------------------
 // Constructor: create new bitmap
-// pixel format for bpp = 32 is A8R8G8B8
-// for bpp = 24 is R8G8B8, for bpp = 16 is R5G6B5, 
+// pixel format for bpp = 32 is PixelFmt::A8R8G8B8
+// for bpp = 24 is PixelFmt::R8G8B8, for bpp = 16 is R5G6B5, 
 // for bpp = 15 is A1R5G5B5 and for bpp = 8 is G8.
 //---------------------------------------------------------------------
 BasicBitmap::BasicBitmap(int width, int height, PixelFmt fmt)
@@ -598,7 +598,7 @@ BasicBitmap::BasicBitmap(BasicBitmap &&src)
 	src._pixelsize = 4;
 	src._pitch = 0;
 	src._mask = 0;
-	src._fmt = A8R8G8B8;
+	src._fmt = PixelFmt::A8PixelFmt::R8G8B8;
 	src._borrow = false;
 }
 #endif
@@ -615,8 +615,8 @@ BasicBitmap::~BasicBitmap()
 
 //---------------------------------------------------------------------
 // Initialize allocate buffer
-// pixel format for bpp = 32 is A8R8G8B8,
-// for bpp = 24 is R8G8B8, for bpp = 16 is R5G6B5, 
+// pixel format for bpp = 32 is PixelFmt::A8PixelFmt::R8G8B8,
+// for bpp = 24 is PixelFmt::R8G8B8, for bpp = 16 is R5G6B5, 
 // for bpp = 15 is A1R5G5B5 and for bpp = 8 is G8.
 //---------------------------------------------------------------------
 int BasicBitmap::Initialize(int width, int height, PixelFmt fmt, void *mem, long pitch)
@@ -624,10 +624,10 @@ int BasicBitmap::Initialize(int width, int height, PixelFmt fmt, void *mem, long
 	int bpp = 0;
 
 	switch (fmt) {
-	case A8R8G8B8: bpp = 32; break;
+	case PixelFmt::A8PixelFmt::R8G8B8: bpp = 32; break;
 	case A8B8G8R8: bpp = 32; break;
-	case X8R8G8B8: bpp = 32; break;
-	case R8G8B8: bpp = 24; break;
+	case PixelFmt::X8PixelFmt::R8G8B8: bpp = 32; break;
+	case PixelFmt::R8G8B8: bpp = 24; break;
 	case R5G6B5: bpp = 16; break;
 	case A1R5G5B5: bpp = 16; break;
 	case X1R5G5B5: bpp = 16; break;
@@ -1430,8 +1430,8 @@ IUINT32 BasicBitmap::GetPixel(int x, int y) const
 
 
 //---------------------------------------------------------------------
-// Get A8R8G8B8 from position, different from GetPixel, GetPixel 
-// returns raw pixel GetColor will convert raw pixel to A8R8G8B8
+// Get PixelFmt::A8PixelFmt::R8G8B8 from position, different from GetPixel, GetPixel 
+// returns raw pixel GetColor will convert raw pixel to PixelFmt::A8R8G8B8
 //---------------------------------------------------------------------
 IUINT32 BasicBitmap::GetColor(int x, int y) const
 {
@@ -1442,32 +1442,32 @@ IUINT32 BasicBitmap::GetColor(int x, int y) const
 	switch (_fmt) {
 	case G8:
 		cc = _pixel_fetch(8, bits, x);
-		cc = RGBA_TO_A8R8G8B8(255, cc, cc, cc);
+		cc = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(255, cc, cc, cc);
 		break;
 	case X1R5G5B5:
 		cc = _pixel_fetch(16, bits, x);
 		RGBA_FROM_X1R5G5B5(cc, r, g, b, a);
-		cc = RGBA_TO_A8R8G8B8(r, g, b, a);
+		cc = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r, g, b, a);
 		break;
 	case A1R5G5B5:
 		cc = _pixel_fetch(16, bits, x);
 		RGBA_FROM_A1R5G5B5(cc, r, g, b, a);
-		cc = RGBA_TO_A8R8G8B8(r, g, b, a);
+		cc = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r, g, b, a);
 		break;
 	case A4R4G4B4:
 		cc = _pixel_fetch(16, bits, x);
 		RGBA_FROM_A4R4G4B4(cc, r, g, b, a);
-		cc = RGBA_TO_A8R8G8B8(r, g, b, a);
+		cc = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r, g, b, a);
 		break;
 	case R5G6B5:
 		cc = _pixel_fetch(16, bits, x);
 		RGBA_FROM_R5G6B5(cc, r, g, b, a);
-		cc = RGBA_TO_A8R8G8B8(r, g, b, a);
+		cc = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r, g, b, a);
 		break;
-	case R8G8B8:
+	case PixelFmt::R8G8B8:
 		cc = _pixel_fetch(24, bits, x) | 0xff000000;
 		break;
-	case X8R8G8B8:
+	case PixelFmt::X8PixelFmt::R8G8B8:
 		cc = _pixel_fetch(32, bits, x) | 0xff000000;
 		break;
 	case A8B8G8R8:
@@ -1475,7 +1475,7 @@ IUINT32 BasicBitmap::GetColor(int x, int y) const
 		cc = (cc & 0xff00ff00) | ((cc & 0xff) << 16) | ((cc & 0xff0000) >> 16);
 		break;
 	case UNKNOW:
-	case A8R8G8B8:
+	case PixelFmt::A8PixelFmt::R8G8B8:
 		cc = _pixel_fetch(32, bits, x);
 		break;
 	}
@@ -1484,8 +1484,8 @@ IUINT32 BasicBitmap::GetColor(int x, int y) const
 
 
 //---------------------------------------------------------------------
-// Set A8R8G8B8 to position, SetPixel set raw pixel, SetColor will
-// convert A8R8G8B8 to raw pixel format then set to position
+// Set PixelFmt::A8PixelFmt::R8G8B8 to position, SetPixel set raw pixel, SetColor will
+// convert PixelFmt::A8PixelFmt::R8G8B8 to raw pixel format then set to position
 //---------------------------------------------------------------------
 void BasicBitmap::SetColor(int x, int y, IUINT32 RGBA)
 {
@@ -1495,42 +1495,42 @@ void BasicBitmap::SetColor(int x, int y, IUINT32 RGBA)
 	IUINT32 r, g, b, a, c;
 	switch (_fmt) {
 	case G8:
-		RGBA_FROM_A8R8G8B8(RGBA, r, g, b, a);
+		RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(RGBA, r, g, b, a);
 		c = _pixel_to_gray(r, g, b);
 		_pixel_store(8, bits, x, c); 
 		break;
 	case X1R5G5B5:
-		RGBA_FROM_A8R8G8B8(RGBA, r, g, b, a);
+		RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(RGBA, r, g, b, a);
 		c = RGBA_TO_X1R5G5B5(r, g, b, a);
 		_pixel_store(16, bits, x, c); 
 		break;
 	case A1R5G5B5:
-		RGBA_FROM_A8R8G8B8(RGBA, r, g, b, a);
+		RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(RGBA, r, g, b, a);
 		c = RGBA_TO_A1R5G5B5(r, g, b, a);
 		_pixel_store(16, bits, x, c); 
 		break;
 	case R5G6B5:
-		RGBA_FROM_A8R8G8B8(RGBA, r, g, b, a);
+		RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(RGBA, r, g, b, a);
 		c = RGBA_TO_R5G6B5(r, g, b, a);
 		_pixel_store(16, bits, x, c); 
 		break;
 	case A4R4G4B4:
-		RGBA_FROM_A8R8G8B8(RGBA, r, g, b, a);
+		RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(RGBA, r, g, b, a);
 		c = RGBA_TO_A4R4G4B4(r, g, b, a);
 		_pixel_store(16, bits, x, c); 
 		break;
-	case R8G8B8:
+	case PixelFmt::R8G8B8:
 		c = RGBA & 0xffffff;
 		_pixel_store(24, bits, x, c); 
 		break;
-	case X8R8G8B8:
+	case PixelFmt::X8PixelFmt::R8G8B8:
 		_pixel_store(32, bits, x, (RGBA & 0xffffff)); 
 		break;
 	case A8B8G8R8:
 		RGBA = (RGBA & 0xff00ff00) | ((RGBA & 0xff) << 16) | ((RGBA & 0xff0000) >> 16);
 		_pixel_store(32, bits, x, RGBA);
 		break;
-	case A8R8G8B8:
+	case PixelFmt::A8PixelFmt::R8G8B8:
 		_pixel_store(32, bits, x, RGBA);
 		break;
 	case UNKNOW:
@@ -1611,13 +1611,13 @@ IUINT32 BasicBitmap::Raw2ARGB(IUINT32 color)
 	case R5G6B5:
 		RGBA_FROM_R5G6B5(color, r, g, b, a);
 		break;
-	case R8G8B8:
-	case X8R8G8B8:
+	case PixelFmt::R8G8B8:
+	case PixelFmt::X8PixelFmt::R8G8B8:
 		return 0xff000000 | color;
 	case A8B8G8R8:
 		return (color & 0xff00ff00) | ((color & 0xff) << 16) | ((color & 0xff0000) >> 16);
 	case UNKNOW:
-	case A8R8G8B8:
+	case PixelFmt::A8PixelFmt::R8G8B8:
 		return color;
 	}
 
@@ -1648,13 +1648,13 @@ IUINT32 BasicBitmap::ARGB2Raw(IUINT32 argb)
 	case A4R4G4B4:
 		c = RGBA_TO_A4R4G4B4(r, g, b, a);
 		break;
-	case R8G8B8:
+	case PixelFmt::R8G8B8:
 		return argb & 0xffffff;
-	case X8R8G8B8:
+	case PixelFmt::X8PixelFmt::R8G8B8:
 		return argb & 0xffffff;
 	case A8B8G8R8:
 		return _pixel_asm_8888(a, b, g, r);
-	case A8R8G8B8:
+	case PixelFmt::A8PixelFmt::R8G8B8:
 		return argb;
 	case UNKNOW:
 		return argb;
@@ -1748,7 +1748,7 @@ void BasicBitmap::Fetch(PixelFmt fmt, const void *bits, int x, int w, IUINT32 *b
 			}
 		}
 		break;
-	case R8G8B8: {
+	case PixelFmt::R8G8B8: {
 			const IUINT8 *src = (const IUINT8*)bits + x * 3;
 			IUINT32 c1, c2;
 			ILINS_LOOP_DOUBLE(
@@ -1768,7 +1768,7 @@ void BasicBitmap::Fetch(PixelFmt fmt, const void *bits, int x, int w, IUINT32 *b
 				);
 		}
 		break;
-	case A8R8G8B8: {
+	case PixelFmt::A8PixelFmt::R8G8B8: {
 			internal_memcpy(buffer, (const IUINT32*)bits + x, w * sizeof(IUINT32));
 		}
 		break;
@@ -1791,7 +1791,7 @@ void BasicBitmap::Fetch(PixelFmt fmt, const void *bits, int x, int w, IUINT32 *b
 				w);
 		}
 		break;
-	case X8R8G8B8: {
+	case PixelFmt::X8PixelFmt::R8G8B8: {
 			const IUINT32 *src = (const IUINT32*)bits + x;
 			ILINS_LOOP_DOUBLE( 
 				{
@@ -1862,7 +1862,7 @@ void BasicBitmap::Store(PixelFmt fmt, void *bits, int x, int w, const IUINT32 *b
 			}
 		}
 		break;
-	case R8G8B8: {
+	case PixelFmt::R8G8B8: {
 			IUINT8 *dst = (IUINT8*)bits + x * 3;
 			IUINT32 c1, c2;
 			ILINS_LOOP_DOUBLE(
@@ -1882,7 +1882,7 @@ void BasicBitmap::Store(PixelFmt fmt, void *bits, int x, int w, const IUINT32 *b
 				);			
 		}
 		break;
-	case A8R8G8B8: {
+	case PixelFmt::A8PixelFmt::R8G8B8: {
 			IUINT32 *dst = (IUINT32*)bits + x;
 			internal_memcpy(dst, buffer, sizeof(IUINT32) * w);
 		}
@@ -1906,7 +1906,7 @@ void BasicBitmap::Store(PixelFmt fmt, void *bits, int x, int w, const IUINT32 *b
 				w);			
 		}
 		break;
-	case X8R8G8B8: {
+	case PixelFmt::X8PixelFmt::R8G8B8: {
 			IUINT32 *dst = (IUINT32*)bits + x;
 			ILINS_LOOP_DOUBLE( 
 				{
@@ -1941,21 +1941,21 @@ BasicBitmap::PixelFmt BasicBitmap::Bpp2Fmt(int bpp)
 	case 16:
 		return R5G6B5;
 	case 24:
-		return R8G8B8;
+		return PixelFmt::R8G8B8;
 	case 32:
-		return A8R8G8B8;
+		return PixelFmt::A8PixelFmt::R8G8B8;
 	}
-	return A8R8G8B8;
+	return PixelFmt::A8PixelFmt::R8G8B8;
 }
 
 int BasicBitmap::Fmt2Bpp(PixelFmt fmt)
 {
 	int bpp = 0;
 	switch (fmt) {
-	case A8R8G8B8: bpp = 32; break;
+	case PixelFmt::A8PixelFmt::R8G8B8: bpp = 32; break;
 	case A8B8G8R8: bpp = 32; break;
-	case X8R8G8B8: bpp = 32; break;
-	case R8G8B8: bpp = 24; break;
+	case PixelFmt::X8PixelFmt::R8G8B8: bpp = 32; break;
+	case PixelFmt::R8G8B8: bpp = 24; break;
 	case R5G6B5: bpp = 16; break;
 	case A1R5G5B5: bpp = 16; break;
 	case X1R5G5B5: bpp = 16; break;
@@ -1968,7 +1968,7 @@ int BasicBitmap::Fmt2Bpp(PixelFmt fmt)
 
 
 //---------------------------------------------------------------------
-// reverse A8R8G8B8
+// reverse PixelFmt::A8R8G8B8
 //---------------------------------------------------------------------
 void BasicBitmap::CardReverse(IUINT32 *card, int size)
 {
@@ -1985,7 +1985,7 @@ void BasicBitmap::CardReverse(IUINT32 *card, int size)
 void BasicBitmap::CardMultiply(IUINT32 *card, int size, IUINT32 color) 
 {
 	IUINT32 r1, g1, b1, a1, r2, g2, b2, a2, f;
-	RGBA_FROM_A8R8G8B8(color, r1, g1, b1, a1);
+	RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(color, r1, g1, b1, a1);
 	if ((color & 0xffffff) == 0xffffff) f = 1;
 	else f = 0;
 	if (color == 0xffffffff) {
@@ -2031,7 +2031,7 @@ void BasicBitmap::CardMultiply(IUINT32 *card, int size, IUINT32 color)
 			g2 = (g1 * g2) >> 8;
 			b2 = (b1 * b2) >> 8;
 			a2 = (a1 * a2) >> 8;
-			*((IUINT32*)src) = RGBA_TO_A8R8G8B8(r2, g2, b2, a2);
+			*((IUINT32*)src) = RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r2, g2, b2, a2);
 		}
 	}
 }
@@ -2145,7 +2145,7 @@ int BasicBitmap::Convert(int x, int y, const BasicBitmap *src, int sx, int sy,
 	int srcy = sy, incy = 1;
 	if (vflip) srcy = sy + h - 1, incy = -1;
 
-	if (dfmt == A8R8G8B8) {
+	if (dfmt == PixelFmt::A8PixelFmt::R8G8B8) {
 		for (int j = 0; j < h; srcy += incy, j++) {
 			IUINT32 *dd = (IUINT32*)Line(y + j) + x;
 			const void *ss = src->Line(srcy);
@@ -2155,7 +2155,7 @@ int BasicBitmap::Convert(int x, int y, const BasicBitmap *src, int sx, int sy,
 			}
 		}
 	}
-	else if (sfmt == A8R8G8B8 && hflip == false) {
+	else if (sfmt == PixelFmt::A8PixelFmt::R8G8B8 && hflip == false) {
 		for (int j = 0; j < h; srcy += incy, j++) {
 			IUINT32 *ss = (IUINT32*)src->Line(srcy) + x;
 			void *dd = Line(y + j);
@@ -2258,11 +2258,11 @@ static int pixel_span_draw_proc_##fmt##_2(void *bits, \
 	return a2 + a1; \
 } 
 
-PIXEL_SPAN_DRAW_PROC_N(A8R8G8B8, 32, 4, NORMAL_FAST)
+PIXEL_SPAN_DRAW_PROC_N(PixelFmt::A8PixelFmt::R8G8B8, 32, 4, NORMAL_FAST)
 PIXEL_SPAN_DRAW_PROC_N(A8B8G8R8, 32, 4, NORMAL_FAST)
-PIXEL_SPAN_DRAW_PROC_N(X8R8G8B8, 32, 4, STATIC)
+PIXEL_SPAN_DRAW_PROC_N(PixelFmt::X8PixelFmt::R8G8B8, 32, 4, STATIC)
 
-PIXEL_SPAN_DRAW_PROC_N(R8G8B8, 24, 3, STATIC)
+PIXEL_SPAN_DRAW_PROC_N(PixelFmt::R8G8B8, 24, 3, STATIC)
 PIXEL_SPAN_DRAW_PROC_N(A1R5G5B5, 16, 2, NORMAL_FAST)
 PIXEL_SPAN_DRAW_PROC_N(A4R4G4B4, 16, 2, NORMAL_FAST)
 PIXEL_SPAN_DRAW_PROC_N(X1R5G5B5, 16, 2, STATIC)
@@ -2289,25 +2289,25 @@ BasicBitmap::PixelDraw BasicBitmap::GetDriver(BasicBitmap::PixelFmt fmt, int mod
 	}
 
 	switch (fmt) {
-	case A8R8G8B8: 
-		if (mode == 0) proc = pixel_span_draw_proc_A8R8G8B8_0;
-		else if (mode == 1) proc = pixel_span_draw_proc_A8R8G8B8_1;
-		else proc = pixel_span_draw_proc_A8R8G8B8_2;
+	case PixelFmt::A8PixelFmt::R8G8B8: 
+		if (mode == 0) proc = pixel_span_draw_proc_PixelFmt::A8PixelFmt::R8G8B8_0;
+		else if (mode == 1) proc = pixel_span_draw_proc_PixelFmt::A8PixelFmt::R8G8B8_1;
+		else proc = pixel_span_draw_proc_PixelFmt::A8PixelFmt::R8G8B8_2;
 		break;
 	case A8B8G8R8: 
 		if (mode == 0) proc = pixel_span_draw_proc_A8B8G8R8_0;
 		else if (mode == 1) proc = pixel_span_draw_proc_A8B8G8R8_1;
 		else proc = pixel_span_draw_proc_A8B8G8R8_2;
 		break;
-	case X8R8G8B8:
-		if (mode == 0) proc = pixel_span_draw_proc_X8R8G8B8_0;
-		else if (mode == 1) proc = pixel_span_draw_proc_X8R8G8B8_1;
-		else proc = pixel_span_draw_proc_X8R8G8B8_2;
+	case PixelFmt::X8PixelFmt::R8G8B8:
+		if (mode == 0) proc = pixel_span_draw_proc_PixelFmt::X8PixelFmt::R8G8B8_0;
+		else if (mode == 1) proc = pixel_span_draw_proc_PixelFmt::X8PixelFmt::R8G8B8_1;
+		else proc = pixel_span_draw_proc_PixelFmt::X8PixelFmt::R8G8B8_2;
 		break;
-	case R8G8B8: 
-		if (mode == 0) proc = pixel_span_draw_proc_R8G8B8_0;
-		else if (mode == 1) proc = pixel_span_draw_proc_R8G8B8_1;
-		else proc = pixel_span_draw_proc_R8G8B8_2;
+	case PixelFmt::R8G8B8: 
+		if (mode == 0) proc = pixel_span_draw_proc_PixelFmt::R8G8B8_0;
+		else if (mode == 1) proc = pixel_span_draw_proc_PixelFmt::R8G8B8_1;
+		else proc = pixel_span_draw_proc_PixelFmt::R8G8B8_2;
 		break;
 	case R5G6B5:
 		if (mode == 0) proc = pixel_span_draw_proc_R5G6B5_0;
@@ -2405,7 +2405,7 @@ int BasicBitmap::Blend(int x, int y, const BasicBitmap *src, int sx, int sy,
 		return Convert(x, y, src, sx, sy, w, h, mode);
 	}
 
-	if (sfmt == A8R8G8B8 && (mode & PIXEL_FLAG_HFLIP) == 0 && color == 0xffffffff) {
+	if (sfmt == PixelFmt::A8PixelFmt::R8G8B8 && (mode & PIXEL_FLAG_HFLIP) == 0 && color == 0xffffffff) {
 		for (int j = 0; j < h; j++) {
 			draw(dbits, x, w, (const IUINT32*)sbits + sx);
 			dbits = (char*)dbits + _pitch;
@@ -3093,7 +3093,7 @@ void BasicBitmap::Premultiply(bool reverse)
 	PixelFmt fmt = _fmt;
 	for (int j = 0; j < _h; j++) {
 		IUINT8 *bits = (IUINT8*)Line(j);
-		if (fmt == X8R8G8B8) {
+		if (fmt == PixelFmt::X8PixelFmt::R8G8B8) {
 			IUINT32 *card = (IUINT32*)bits;
 			for (int i = _w; i > 0; card++, i--) {
 				card[0] |= 0xff000000;
@@ -3102,7 +3102,7 @@ void BasicBitmap::Premultiply(bool reverse)
 		}
 		if (reverse == false) {
 			switch (fmt) {
-			case A8R8G8B8:
+			case PixelFmt::A8PixelFmt::R8G8B8:
 				{
 					IUINT32 *card = (IUINT32*)bits;
 					for (int i = _w; i > 0; card++, i--) {
@@ -3150,7 +3150,7 @@ void BasicBitmap::Premultiply(bool reverse)
 		}
 		else {
 			switch (fmt) {
-			case A8R8G8B8:
+			case PixelFmt::A8PixelFmt::R8G8B8:
 				{
 					IUINT32 *card = (IUINT32*)bits;
 					for (int i = _w; i > 0; card++, i--) {
@@ -3503,7 +3503,7 @@ void BasicBitmap::Scale(int dx, int dy, int dw, int dh, const BasicBitmap *src,
 			CardReverse(srcrow, sw);
 		}
 
-		if (sfmt == X8R8G8B8) {
+		if (sfmt == PixelFmt::X8PixelFmt::R8G8B8) {
 			CardSetAlpha(srcrow, sw, 0xff);
 		}
 
@@ -3949,8 +3949,8 @@ int BasicBitmap::SavePPM(const char *filename) const
 	const BasicBitmap *dst = this;
 	BasicBitmap *tmp = NULL;
 
-	if (fmt != A8R8G8B8 || fmt != X8R8G8B8) {
-		tmp = new BasicBitmap(_w, _h, A8R8G8B8);
+	if (fmt != PixelFmt::A8PixelFmt::R8G8B8 || fmt != PixelFmt::X8PixelFmt::R8G8B8) {
+		tmp = new BasicBitmap(_w, _h, PixelFmt::A8PixelFmt::R8G8B8);
 		if (tmp == NULL) {
 			fclose(fp);
 			return -1;
@@ -4265,12 +4265,12 @@ void BasicBitmap::InitDIBInfo(void *ptr, int width, int height, PixelFmt fmt)
 			data[10] = 0xf00; data[11] = 0xf0;
 			data[12] = 0xf; data[13] = 0xf000;
 			break;
-		case R8G8B8:
+		case PixelFmt::R8G8B8:
 			data[10] = 0xff0000; data[11] = 0xff00; 
 			data[12] = 0xff; data[13] = 0;
 			break;
-		case X8R8G8B8:
-		case A8R8G8B8:
+		case PixelFmt::X8PixelFmt::R8G8B8:
+		case PixelFmt::A8PixelFmt::R8G8B8:
 			data[10] = 0xff0000; data[11] = 0xff00; 
 			data[12] = 0xff; data[13] = 0xff000000;
 			break;
@@ -4797,8 +4797,8 @@ BasicBitmap *BasicBitmap::GdiPlusLoadImageFromMemory(const void *data, long size
 	case 8: fmt = G8; break;
 	case 555: fmt = X1R5G5B5; break;
 	case 565: fmt = R5G6B5; break;
-	case 888: fmt = R8G8B8; break;
-	case 8888: fmt = A8R8G8B8; break;
+	case 888: fmt = PixelFmt::R8G8B8; break;
+	case 8888: fmt = PixelFmt::A8PixelFmt::R8G8B8; break;
 	default:
 		fmt = UNKNOW;
 		break;
@@ -5422,12 +5422,12 @@ IUINT32 BasicBitmap::SampleBicubic(float x, float y, bool repeat) const
 #if 0
 	IUINT32 r2, g2, b2, a2;
 	IUINT32 ci = GetColor(xi, yi);
-	RGBA_FROM_A8R8G8B8(ci, r2, g2, b2, a2);
+	RGBA_FROM_PixelFmt::A8PixelFmt::R8G8B8(ci, r2, g2, b2, a2);
 	if (_pixel_abs(r1 - r2) > 198 || _pixel_abs(g1 - g2) > 198 ||
 		_pixel_abs(b1 - b2) > 198 || _pixel_abs(a1 - a2) > 198)
 		return ci;
 #endif
-	return RGBA_TO_A8R8G8B8(r1, g1, b1, a1);
+	return RGBA_TO_PixelFmt::A8PixelFmt::R8G8B8(r1, g1, b1, a1);
 }
 
 
@@ -5818,7 +5818,7 @@ int BasicBitmap_ResampleAvg(BasicBitmap *dst, int dx, int dy, int dw, int dh,
 	}
 
 	if (src->Bpp() == 32) {
-		BasicBitmap *bmp = new BasicBitmap(dstwidth, dstheight, BasicBitmap::A8R8G8B8);
+		BasicBitmap *bmp = new BasicBitmap(dstwidth, dstheight, BasicBitmap::PixelFmt::A8PixelFmt::R8G8B8);
 		if (bmp == NULL) return -1;
 		int hr = BasicBitmap_ResampleSmooth(bmp->Address8(0, 0), 
 					(const IUINT8*)src->Address32(sx, sy),
@@ -5828,7 +5828,7 @@ int BasicBitmap_ResampleAvg(BasicBitmap *dst, int dx, int dy, int dw, int dh,
 			delete bmp;
 			return -2;
 		}
-		if (sfmt == BasicBitmap::X8R8G8B8) {
+		if (sfmt == BasicBitmap::X8PixelFmt::R8G8B8) {
 			bmp->SetAlphaForAllPixel(255);
 		}
 		dst->Convert(dx, dy, bmp, 0, 0, bmp->Width(), bmp->Height());
@@ -5837,7 +5837,7 @@ int BasicBitmap_ResampleAvg(BasicBitmap *dst, int dx, int dy, int dw, int dh,
 	}
 
 	if (dst->Bpp() == 32) {
-		BasicBitmap *bmp = new BasicBitmap(srcwidth, srcheight, BasicBitmap::A8R8G8B8);
+		BasicBitmap *bmp = new BasicBitmap(srcwidth, srcheight, BasicBitmap::PixelFmt::A8PixelFmt::R8G8B8);
 		if (bmp == NULL) return -3;
 		bmp->Convert(0, 0, src, 0, 0, srcwidth, srcheight);
 		int hr = BasicBitmap_ResampleSmooth((IUINT8*)dst->Address32(dx, dy),
@@ -5851,8 +5851,8 @@ int BasicBitmap_ResampleAvg(BasicBitmap *dst, int dx, int dy, int dw, int dh,
 		return 0;
 	}
 
-	BasicBitmap *bs = new BasicBitmap(sw, sh, BasicBitmap::A8R8G8B8);
-	BasicBitmap *bd = new BasicBitmap(dw, dh, BasicBitmap::A8R8G8B8);
+	BasicBitmap *bs = new BasicBitmap(sw, sh, BasicBitmap::PixelFmt::A8PixelFmt::R8G8B8);
+	BasicBitmap *bd = new BasicBitmap(dw, dh, BasicBitmap::PixelFmt::A8PixelFmt::R8G8B8);
 
 	if (bs == NULL || bd == NULL) {
 		if (bs) delete bs;

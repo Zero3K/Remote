@@ -214,10 +214,10 @@ struct PerformanceMonitor {
 	
 	void RecordFrame(double paintTimeMs, double conversionTimeMs, double compressionTimeMs = 0.0, double batchSizeKB = 0.0, bool compressionSkipped = false) {
 		frameCount++;
-		avgPaintTime = (avgPaintTime * (frameCount - 1) + paintTimeMs) / frameCount;
-		avgConversionTime = (avgConversionTime * (frameCount - 1) + conversionTimeMs) / frameCount;
-		avgCompressionTime = (avgCompressionTime * (frameCount - 1) + compressionTimeMs) / frameCount;
-		avgNetworkBatchSize = (avgNetworkBatchSize * (frameCount - 1) + batchSizeKB) / frameCount;
+		avgPaintTime = (avgPaintTime * (static_cast<double>(frameCount) - 1) + paintTimeMs) / frameCount;
+		avgConversionTime = (avgConversionTime * (static_cast<double>(frameCount) - 1) + conversionTimeMs) / frameCount;
+		avgCompressionTime = (avgCompressionTime * (static_cast<double>(frameCount) - 1) + compressionTimeMs) / frameCount;
+		avgNetworkBatchSize = (avgNetworkBatchSize * (static_cast<double>(frameCount) - 1) + batchSizeKB) / frameCount;
 		if (compressionSkipped) compressionSkipCount++;
 		
 		auto now = std::chrono::steady_clock::now();
@@ -254,7 +254,7 @@ public:
 			available.pop_back();
 			return bmp;
 		}
-		return new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
+		return new BasicBitmap(width, height, BasicBitmap::PixelFmt::A8R8G8B8);
 	}
 	
 	void Release(BasicBitmap* bmp) {
@@ -441,9 +441,9 @@ private:
 	std::condition_variable jobCondition;
 	
 	struct ConversionJob {
-		const uint8_t* src;
-		uint8_t* dst;
-		int pixelCount;
+		const uint8_t* src = nullptr;
+		uint8_t* dst = nullptr;
+		int pixelCount = 0;
 		std::atomic<bool> complete{false};
 	};
 	
@@ -680,7 +680,7 @@ void detect_dirty_tiles(
 // Extract a tile from a source RGBA buffer into a new BasicBitmap
 BasicBitmap* extract_tile_basicbitmap(const uint8_t* rgba, int width, int height, const DirtyTile& r) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
-	BasicBitmap* tile = new BasicBitmap(rw, rh, BasicBitmap::A8R8G8B8);
+	BasicBitmap* tile = new BasicBitmap(rw, rh, BasicBitmap::PixelFmt::A8R8G8B8);
 	for (int row = 0; row < rh; ++row) {
 		const uint8_t* src = rgba + ((r.top + row) * width + r.left) * 4;
 		uint8_t* dst = tile->Bits() + row * rw * 4;
@@ -694,7 +694,7 @@ bool QOIEncodeSubimage_BasicBitmap(
 	const std::vector<uint8_t>& rgba, int width, int height, const DirtyTile& r, std::vector<uint8_t>& outQoi
 ) {
 	int rw = r.right - r.left, rh = r.bottom - r.top;
-	BasicBitmap tile(rw, rh, BasicBitmap::A8R8G8B8);
+	BasicBitmap tile(rw, rh, BasicBitmap::PixelFmt::A8R8G8B8);
 
 	for (int row = 0; row < rh; ++row) {
 		const uint8_t* src = &rgba[((r.top + row) * width + r.left) * 4];
@@ -1058,7 +1058,7 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	DeleteDC(hMemDC);
 	ReleaseDC(NULL, hScreenDC);
 
-	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
+	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::PixelFmt::A8R8G8B8);
 	uint8_t* src = static_cast<uint8_t*>(pBits);
 	uint8_t* dst = bmp->Bits();
 	for (int i = 0; i < width * height; ++i) {
@@ -1129,7 +1129,7 @@ BasicBitmap* QOIDecodeToBasicBitmap(const uint8_t* data, size_t len) {
 	qoi_desc desc;
 	uint8_t* decoded = (uint8_t*)qoi_decode(data, len, &desc, 4);
 	if (!decoded) return nullptr;
-	BasicBitmap* bmp = new BasicBitmap(desc.width, desc.height, BasicBitmap::A8R8G8B8);
+	BasicBitmap* bmp = new BasicBitmap(desc.width, desc.height, BasicBitmap::PixelFmt::A8R8G8B8);
 	memcpy(bmp->Bits(), decoded, desc.width * desc.height * 4);
 	free(decoded);
 	return bmp;
@@ -1538,7 +1538,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			int tileW = std::min(TILE_W, width - tileLeft);
 			int tileH = std::min(TILE_H, height - tileTop);
 
-			BasicBitmap tile(tileW, tileH, BasicBitmap::A8R8G8B8);
+			BasicBitmap tile(tileW, tileH, BasicBitmap::PixelFmt::A8R8G8B8);
 			for (int row = 0; row < tileH; ++row) {
 				const uint8_t* src = curr_rgba + ((tileTop + row) * width + tileLeft) * 4;
 				uint8_t* dst = tile.Bits() + row * tileW * 4;
@@ -1605,7 +1605,7 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			tileSeq++;
 			
 			// Send batch if we're at the end of dirty tiles or batch is getting large
-			bool isLastTile = (tileSeq >= dirtyCount);
+			bool isLastTile = (tileSeq >= DirtyTileIndices.size());
 			bool shouldFlushBatch = (networkBuffer.size() >= MAX_BATCH_SIZE / 2) || isLastTile;
 			
 			if (shouldFlushBatch && !networkBuffer.empty()) {
@@ -1996,7 +1996,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				// Reallocate if needed
 				if (!bmpState->bmp || bmpState->imgW != maxW || bmpState->imgH != maxH) {
 					delete bmpState->bmp;
-					bmpState->bmp = new BasicBitmap(maxW, maxH, BasicBitmap::A8R8G8B8);
+					bmpState->bmp = new BasicBitmap(maxW, maxH, BasicBitmap::PixelFmt::A8R8G8B8);
 					bmpState->imgW = maxW; bmpState->imgH = maxH;
 				}
 				
@@ -2346,8 +2346,8 @@ public:
 	struct ServerData
 	{
 		std::string ip;
-		int maxClients;
-		INPUT inputBuff;
+		int maxClients = 0;
+		INPUT inputBuff = {};
 		int nConnected = 0;
 		bool isOnline = false;
 		bool bAccepting = false;
@@ -2356,16 +2356,16 @@ public:
 		std::string port;
 
 		bool isRegistered = false;
-		RAWINPUTDEVICE rid[3]; // index #2 not used
+		RAWINPUTDEVICE rid[3] = {}; // index #2 not used
 		std::queue<INPUT> inputQueue;
 
 		bool bPause = true;
 
 		struct ClientInfo
 		{
-			SOCKET socket;
+			SOCKET socket = INVALID_SOCKET;
 			std::string ip;
-			int id;
+			int id = 0;
 		};
 
 		std::vector<ClientInfo> ClientsInformation;
@@ -2384,7 +2384,7 @@ public:
 		short nOffsetY = 0;
 		int oldX = 0;
 		int oldY = 0;
-		POINT mPos;
+		POINT mPos = {};
 
 	} Server;
 
@@ -2393,7 +2393,7 @@ public:
 	struct ClientData
 	{
 		std::string ip;
-		INPUT recvBuff;
+		INPUT recvBuff = {};
 		bool isConnected = false;
 		bool wasClient = false;
 
