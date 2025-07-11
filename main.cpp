@@ -210,7 +210,48 @@ struct PerformanceMonitor {
 	}
 };
 
-static PerformanceMonitor g_perfMonitor;
+// Memory pool for efficient bitmap management
+class BitmapPool {
+private:
+	std::vector<BasicBitmap*> available;
+	std::mutex poolMutex;
+	int width, height;
+	
+public:
+	BitmapPool(int w, int h) : width(w), height(h) {}
+	
+	BasicBitmap* Acquire() {
+		std::lock_guard<std::mutex> lock(poolMutex);
+		if (!available.empty()) {
+			BasicBitmap* bmp = available.back();
+			available.pop_back();
+			return bmp;
+		}
+		return new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
+	}
+	
+	void Release(BasicBitmap* bmp) {
+		if (bmp && bmp->Width() == width && bmp->Height() == height) {
+			std::lock_guard<std::mutex> lock(poolMutex);
+			available.push_back(bmp);
+		} else {
+			delete bmp;
+		}
+	}
+	
+	~BitmapPool() {
+		for (auto* bmp : available) {
+			delete bmp;
+		}
+	}
+};
+
+// Global cache for per-window DIB sections
+static std::unordered_map<HWND, struct {
+	HBITMAP hCachedBmp;
+	void* pCachedBits;
+	int cachedSrcW, cachedSrcH;
+}> g_windowCache;
 struct AsyncRenderState {
 	std::mutex frameMutex;
 	std::condition_variable frameReady;
@@ -2331,86 +2372,90 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		FillRect(hdcBuf, &clientRect, brush);
 		DeleteObject(brush);
 
-		// Use the bmpState retrieved at the top!
+		// Use more efficient frame handling with reduced locking
 		if (bmpState && bmpState->bmp) {
-			EnterCriticalSection(&bmpState->cs);
-			int srcW = bmpState->bmp->Width();
-			int srcH = bmpState->bmp->Height();
-			double srcAspect = (double)srcW / srcH;
-			double destAspect = (double)destW / destH;
-			int drawW, drawH, offsetX, offsetY;
-			if (destAspect > srcAspect) {
-				drawH = destH;
-				drawW = (int)(drawH * srcAspect);
-				offsetX = (destW - drawW) / 2;
-				offsetY = 0;
-			}
-			else {
-				drawW = destW;
-				drawH = (int)(drawW / srcAspect);
-				offsetX = 0;
-				offsetY = (destH - drawH) / 2;
-			}
+			// Try to acquire lock with timeout to avoid blocking rendering
+			if (TryEnterCriticalSection(&bmpState->cs)) {
+				int srcW = bmpState->bmp->Width();
+				int srcH = bmpState->bmp->Height();
+				double srcAspect = (double)srcW / srcH;
+				double destAspect = (double)destW / destH;
+				int drawW, drawH, offsetX, offsetY;
+				if (destAspect > srcAspect) {
+					drawH = destH;
+					drawW = (int)(drawH * srcAspect);
+					offsetX = (destW - drawW) / 2;
+					offsetY = 0;
+				}
+				else {
+					drawW = destW;
+					drawH = (int)(drawW / srcAspect);
+					offsetX = 0;
+					offsetY = (destH - drawH) / 2;
+				}
 
-			// Cache the source bitmap DIB section to avoid recreating it every paint
-			static HBITMAP hCachedBmp = NULL;
-			static void* pCachedBits = nullptr;
-			static int cachedSrcW = 0, cachedSrcH = 0;
-			
-			HBITMAP hBmp;
-			void* pBits;
-			
-			if (!hCachedBmp || cachedSrcW != srcW || cachedSrcH != srcH) {
-				// Source dimensions changed, create new DIB section
-				if (hCachedBmp) {
-					DeleteObject(hCachedBmp);
+				// Enhanced per-window DIB caching
+				auto& cache = g_windowCache[hwnd];
+				HBITMAP hBmp;
+				void* pBits;
+				
+				if (!cache.hCachedBmp || cache.cachedSrcW != srcW || cache.cachedSrcH != srcH) {
+					// Source dimensions changed, create new DIB section
+					if (cache.hCachedBmp) {
+						DeleteObject(cache.hCachedBmp);
+					}
+					
+					BITMAPINFO bmi = { 0 };
+					bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+					bmi.bmiHeader.biWidth = srcW;
+					bmi.bmiHeader.biHeight = -srcH;
+					bmi.bmiHeader.biPlanes = 1;
+					bmi.bmiHeader.biBitCount = 32;
+					bmi.bmiHeader.biCompression = BI_RGB;
+					cache.hCachedBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &cache.pCachedBits, NULL, 0);
+					cache.cachedSrcW = srcW;
+					cache.cachedSrcH = srcH;
 				}
 				
-				BITMAPINFO bmi = { 0 };
-				bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-				bmi.bmiHeader.biWidth = srcW;
-				bmi.bmiHeader.biHeight = -srcH;
-				bmi.bmiHeader.biPlanes = 1;
-				bmi.bmiHeader.biBitCount = 32;
-				bmi.bmiHeader.biCompression = BI_RGB;
-				hCachedBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pCachedBits, NULL, 0);
-				cachedSrcW = srcW;
-				cachedSrcH = srcH;
-			}
-			
-			hBmp = hCachedBmp;
-			pBits = pCachedBits;
+				hBmp = cache.hCachedBmp;
+				pBits = cache.pCachedBits;
 
-			// RGBA to BGRA - SIMD optimized conversion with performance monitoring
-			auto conversionStart = std::chrono::high_resolution_clock::now();
-			uint8_t* src = bmpState->bmp->Bits();
-			uint8_t* dst = (uint8_t*)pBits;
-			int totalPixels = srcW * srcH;
-			
-			// Use the highly optimized SIMD color conversion (AVX2/SSE2/scalar auto-dispatched)
-			ColorConversion::ConvertRGBAToBGRA(src, dst, totalPixels);
-			auto conversionEnd = std::chrono::high_resolution_clock::now();
-			
-			double conversionTimeMs = std::chrono::duration<double, std::milli>(conversionEnd - conversionStart).count();
-			static double totalConversionTime = 0.0;
-			static int conversionCount = 0;
-			totalConversionTime += conversionTimeMs;
-			conversionCount++;
-			
-			// Print performance stats every 100 frames
-			if (conversionCount % 100 == 0) {
-				std::cout << "Color conversion performance: avg " << (totalConversionTime / conversionCount) 
-						  << "ms per frame (" << totalPixels << " pixels)" << std::endl;
-			}
+				// RGBA to BGRA - SIMD optimized conversion with performance monitoring
+				auto conversionStart = std::chrono::high_resolution_clock::now();
+				uint8_t* src = bmpState->bmp->Bits();
+				uint8_t* dst = (uint8_t*)pBits;
+				int totalPixels = srcW * srcH;
+				
+				// Use the highly optimized SIMD color conversion (AVX2/SSE2/scalar auto-dispatched)
+				ColorConversion::ConvertRGBAToBGRA(src, dst, totalPixels);
+				auto conversionEnd = std::chrono::high_resolution_clock::now();
+				
+				double conversionTimeMs = std::chrono::duration<double, std::milli>(conversionEnd - conversionStart).count();
+				static double totalConversionTime = 0.0;
+				static int conversionCount = 0;
+				totalConversionTime += conversionTimeMs;
+				conversionCount++;
+				
+				// Print performance stats every 100 frames
+				if (conversionCount % 100 == 0) {
+					std::cout << "Color conversion performance: avg " << (totalConversionTime / conversionCount) 
+							  << "ms per frame (" << totalPixels << " pixels)" << std::endl;
+				}
 
-			HDC hMem = CreateCompatibleDC(hdcBuf);
-			HGDIOBJ oldObj = SelectObject(hMem, hBmp);
-			SetStretchBltMode(hdcBuf, HALFTONE);  // Better quality and often faster than COLORONCOLOR
-			StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
-			SelectObject(hMem, oldObj);
-			DeleteDC(hMem);
-			// Note: Don't delete hBmp as it's now cached
-			LeaveCriticalSection(&bmpState->cs);
+				HDC hMem = CreateCompatibleDC(hdcBuf);
+				HGDIOBJ oldObj = SelectObject(hMem, hBmp);
+				SetStretchBltMode(hdcBuf, HALFTONE);  // Better quality and often faster than COLORONCOLOR
+				StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
+				SelectObject(hMem, oldObj);
+				DeleteDC(hMem);
+				// Note: Don't delete hBmp as it's now cached
+				LeaveCriticalSection(&bmpState->cs);
+			} else {
+				// If we can't get the lock immediately, draw a "loading" indicator
+				HBRUSH grayBrush = CreateSolidBrush(RGB(50, 50, 50));
+				FillRect(hdcBuf, &clientRect, grayBrush);
+				DeleteObject(grayBrush);
+			}
 		}
 		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
 		SelectObject(hdcBuf, oldBufBmp);
@@ -2433,19 +2478,21 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 		break;
 
 	case WM_DESTROY: {
+		// Clean up per-window cached DIB section
+		auto it = g_windowCache.find(hwnd);
+		if (it != g_windowCache.end()) {
+			if (it->second.hCachedBmp) {
+				DeleteObject(it->second.hCachedBmp);
+			}
+			g_windowCache.erase(it);
+		}
+
 		static HBITMAP hDoubleBufBmp = NULL;
 		static void* pDoubleBufBits = NULL;
 		if (hDoubleBufBmp) {
 			DeleteObject(hDoubleBufBmp);
 			hDoubleBufBmp = NULL;
 			pDoubleBufBits = NULL;
-		}
-		
-		// Clean up cached source bitmap
-		static HBITMAP hCachedBmp = NULL;
-		if (hCachedBmp) {
-			DeleteObject(hCachedBmp);
-			hCachedBmp = NULL;
 		}
 		
 		if (bmpState) {
