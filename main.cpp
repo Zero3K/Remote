@@ -229,10 +229,10 @@ struct PerformanceMonitor {
 	
 	void RecordFrame(double paintTimeMs, double conversionTimeMs, double compressionTimeMs = 0.0, double batchSizeKB = 0.0, bool compressionSkipped = false) {
 		frameCount++;
-		avgPaintTime = (avgPaintTime * (frameCount - 1) + paintTimeMs) / frameCount;
-		avgConversionTime = (avgConversionTime * (frameCount - 1) + conversionTimeMs) / frameCount;
-		avgCompressionTime = (avgCompressionTime * (frameCount - 1) + compressionTimeMs) / frameCount;
-		avgNetworkBatchSize = (avgNetworkBatchSize * (frameCount - 1) + batchSizeKB) / frameCount;
+		avgPaintTime = (avgPaintTime * (static_cast<double>(frameCount) - 1) + paintTimeMs) / frameCount;
+		avgConversionTime = (avgConversionTime * (static_cast<double>(frameCount) - 1) + conversionTimeMs) / frameCount;
+		avgCompressionTime = (avgCompressionTime * (static_cast<double>(frameCount) - 1) + compressionTimeMs) / frameCount;
+		avgNetworkBatchSize = (avgNetworkBatchSize * (static_cast<double>(frameCount) - 1) + batchSizeKB) / frameCount;
 		if (compressionSkipped) compressionSkipCount++;
 		
 		auto now = std::chrono::steady_clock::now();
@@ -456,9 +456,9 @@ private:
 	std::condition_variable jobCondition;
 	
 	struct ConversionJob {
-		const uint8_t* src;
-		uint8_t* dst;
-		int pixelCount;
+		const uint8_t* src = nullptr;
+		uint8_t* dst = nullptr;
+		int pixelCount = 0;
 		std::atomic<bool> complete{false};
 	};
 	
@@ -2469,8 +2469,8 @@ public:
 	struct ServerData
 	{
 		std::string ip;
-		int maxClients;
-		INPUT inputBuff;
+		int maxClients = 0;
+		INPUT inputBuff = {};
 		int nConnected = 0;
 		bool isOnline = false;
 		bool bAccepting = false;
@@ -2479,16 +2479,16 @@ public:
 		std::string port;
 
 		bool isRegistered = false;
-		RAWINPUTDEVICE rid[3]; // index #2 not used
+		RAWINPUTDEVICE rid[3] = {}; // index #2 not used
 		std::queue<INPUT> inputQueue;
 
 		bool bPause = true;
 
 		struct ClientInfo
 		{
-			SOCKET socket;
+			SOCKET socket = INVALID_SOCKET;
 			std::string ip;
-			int id;
+			int id = 0;
 		};
 
 		std::vector<ClientInfo> ClientsInformation;
@@ -2507,7 +2507,7 @@ public:
 		short nOffsetY = 0;
 		int oldX = 0;
 		int oldY = 0;
-		POINT mPos;
+		POINT mPos = {};
 
 	} Server;
 
@@ -2516,7 +2516,7 @@ public:
 	struct ClientData
 	{
 		std::string ip;
-		INPUT recvBuff;
+		INPUT recvBuff = {};
 		bool isConnected = false;
 		bool wasClient = false;
 
