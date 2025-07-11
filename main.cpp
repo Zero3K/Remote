@@ -1520,11 +1520,21 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				InvalidateRect(hwnd, NULL, FALSE);
 				SRDPRINTF("ScreenRecvThread: InvalidateRect(NULL)\n");
 			}
-			else {
-				for (const RECT& r : invalidateRects) {
-					InvalidateRect(hwnd, &r, FALSE);
-					SRDPRINTF("ScreenRecvThread: InvalidateRect(%ld,%ld,%ld,%ld)\n", r.left, r.top, r.right, r.bottom);
+			else if (!invalidateRects.empty()) {
+				// Batch invalidation: combine all dirty rectangles into a single bounding rectangle
+				// This significantly reduces the number of paint events
+				RECT boundingRect = invalidateRects[0];
+				for (size_t i = 1; i < invalidateRects.size(); ++i) {
+					const RECT& r = invalidateRects[i];
+					if (r.left < boundingRect.left) boundingRect.left = r.left;
+					if (r.top < boundingRect.top) boundingRect.top = r.top;
+					if (r.right > boundingRect.right) boundingRect.right = r.right;
+					if (r.bottom > boundingRect.bottom) boundingRect.bottom = r.bottom;
 				}
+				
+				InvalidateRect(hwnd, &boundingRect, FALSE);
+				SRDPRINTF("ScreenRecvThread: InvalidateRect batched (%ld,%ld,%ld,%ld) from %zu tiles\n", 
+					boundingRect.left, boundingRect.top, boundingRect.right, boundingRect.bottom, invalidateRects.size());
 			}
 			if (frame_error) {
 				SRDPRINTF("ScreenRecvThread: frame_error, breaking\n");
@@ -2146,20 +2156,70 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				offsetY = (destH - drawH) / 2;
 			}
 
-			BITMAPINFO bmi = { 0 };
-			bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-			bmi.bmiHeader.biWidth = srcW;
-			bmi.bmiHeader.biHeight = -srcH;
-			bmi.bmiHeader.biPlanes = 1;
-			bmi.bmiHeader.biBitCount = 32;
-			bmi.bmiHeader.biCompression = BI_RGB;
-			void* pBits = nullptr;
-			HBITMAP hBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+			// Cache the source bitmap DIB section to avoid recreating it every paint
+			static HBITMAP hCachedBmp = NULL;
+			static void* pCachedBits = nullptr;
+			static int cachedSrcW = 0, cachedSrcH = 0;
+			
+			HBITMAP hBmp;
+			void* pBits;
+			
+			if (!hCachedBmp || cachedSrcW != srcW || cachedSrcH != srcH) {
+				// Source dimensions changed, create new DIB section
+				if (hCachedBmp) {
+					DeleteObject(hCachedBmp);
+				}
+				
+				BITMAPINFO bmi = { 0 };
+				bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+				bmi.bmiHeader.biWidth = srcW;
+				bmi.bmiHeader.biHeight = -srcH;
+				bmi.bmiHeader.biPlanes = 1;
+				bmi.bmiHeader.biBitCount = 32;
+				bmi.bmiHeader.biCompression = BI_RGB;
+				hCachedBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &pCachedBits, NULL, 0);
+				cachedSrcW = srcW;
+				cachedSrcH = srcH;
+			}
+			
+			hBmp = hCachedBmp;
+			pBits = pCachedBits;
 
-			// RGBA to BGRA
+			// RGBA to BGRA - optimized conversion
 			uint8_t* src = bmpState->bmp->Bits();
 			uint8_t* dst = (uint8_t*)pBits;
-			for (int i = 0; i < srcW * srcH; ++i) {
+			int totalPixels = srcW * srcH;
+			
+			// Process 4 pixels at a time for better cache efficiency
+			int i = 0;
+			for (; i < totalPixels - 3; i += 4) {
+				// First pixel
+				dst[i * 4 + 0] = src[i * 4 + 2]; // B
+				dst[i * 4 + 1] = src[i * 4 + 1]; // G
+				dst[i * 4 + 2] = src[i * 4 + 0]; // R
+				dst[i * 4 + 3] = 255;            // A
+				
+				// Second pixel
+				dst[(i+1) * 4 + 0] = src[(i+1) * 4 + 2]; // B
+				dst[(i+1) * 4 + 1] = src[(i+1) * 4 + 1]; // G
+				dst[(i+1) * 4 + 2] = src[(i+1) * 4 + 0]; // R
+				dst[(i+1) * 4 + 3] = 255;                // A
+				
+				// Third pixel
+				dst[(i+2) * 4 + 0] = src[(i+2) * 4 + 2]; // B
+				dst[(i+2) * 4 + 1] = src[(i+2) * 4 + 1]; // G
+				dst[(i+2) * 4 + 2] = src[(i+2) * 4 + 0]; // R
+				dst[(i+2) * 4 + 3] = 255;                // A
+				
+				// Fourth pixel
+				dst[(i+3) * 4 + 0] = src[(i+3) * 4 + 2]; // B
+				dst[(i+3) * 4 + 1] = src[(i+3) * 4 + 1]; // G
+				dst[(i+3) * 4 + 2] = src[(i+3) * 4 + 0]; // R
+				dst[(i+3) * 4 + 3] = 255;                // A
+			}
+			
+			// Handle remaining pixels
+			for (; i < totalPixels; ++i) {
 				dst[i * 4 + 0] = src[i * 4 + 2]; // B
 				dst[i * 4 + 1] = src[i * 4 + 1]; // G
 				dst[i * 4 + 2] = src[i * 4 + 0]; // R
@@ -2168,11 +2228,11 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
 			HDC hMem = CreateCompatibleDC(hdcBuf);
 			HGDIOBJ oldObj = SelectObject(hMem, hBmp);
-			SetStretchBltMode(hdcBuf, COLORONCOLOR);
+			SetStretchBltMode(hdcBuf, HALFTONE);  // Better quality and often faster than COLORONCOLOR
 			StretchBlt(hdcBuf, offsetX, offsetY, drawW, drawH, hMem, 0, 0, srcW, srcH, SRCCOPY);
 			SelectObject(hMem, oldObj);
 			DeleteDC(hMem);
-			DeleteObject(hBmp);
+			// Note: Don't delete hBmp as it's now cached
 			LeaveCriticalSection(&bmpState->cs);
 		}
 		BitBlt(hdc, 0, 0, destW, destH, hdcBuf, 0, 0, SRCCOPY);
@@ -2203,6 +2263,14 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 			hDoubleBufBmp = NULL;
 			pDoubleBufBits = NULL;
 		}
+		
+		// Clean up cached source bitmap
+		static HBITMAP hCachedBmp = NULL;
+		if (hCachedBmp) {
+			DeleteObject(hCachedBmp);
+			hCachedBmp = NULL;
+		}
+		
 		if (bmpState) {
 			delete bmpState;
 			// Do NOT clear GWLP_USERDATA here!
