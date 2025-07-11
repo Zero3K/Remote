@@ -1112,20 +1112,19 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 		return false;
 	}
 	
-	// Create BasicBitmap and convert colors using optimized SIMD function
+	// Create BasicBitmap with direct memory copy (no color conversion needed)
 	BasicBitmap* bmp = new BasicBitmap(width, height, BasicBitmap::A8R8G8B8);
 	uint8_t* src = static_cast<uint8_t*>(pBits);
 	uint8_t* dst = bmp->Bits();
 	
-	// Convert from Windows DIB BGRA format to BasicBitmap A8R8G8B8 format
-	// CreateDIBSection with BI_RGB stores data as BGRA in memory
-	// BasicBitmap A8R8G8B8 expects BGRA in memory on little-endian systems
-	// So we can do a direct copy with alpha channel set to 255
+	// Direct copy from Windows DIB BGRA to BasicBitmap BGRA format
+	// Both Windows DIB (BI_RGB) and BasicBitmap A8R8G8B8 store as BGRA in memory
+	// Only need to set alpha channel to opaque since DIB doesn't guarantee alpha values
+	memcpy(dst, src, width * height * 4);
+	
+	// Set alpha channel to opaque for all pixels
 	for (int i = 0; i < width * height; ++i) {
-		dst[i * 4 + 0] = src[i * 4 + 0]; // B (stays B)
-		dst[i * 4 + 1] = src[i * 4 + 1]; // G (stays G)  
-		dst[i * 4 + 2] = src[i * 4 + 2]; // R (stays R)
-		dst[i * 4 + 3] = 255;            // A (set to opaque, was undefined)
+		dst[i * 4 + 3] = 255; // Set alpha to opaque
 	}
 	
 	outBmp = bmp;
@@ -1753,10 +1752,13 @@ void ScreenStreamServerThread(SOCKET sktClient) {
 			lastPrint = now;
 		}
 		auto elapsed = duration_cast<milliseconds>(steady_clock::now() - start).count();
-		// Use high-resolution timing instead of Sleep for better performance
+		// Use high-resolution timing with microsecond precision for smoother frame delivery
 		if (elapsed < frameInterval) {
 			auto targetTime = start + milliseconds(frameInterval);
-			std::this_thread::sleep_until(targetTime);
+			// Use precise timing to reduce frame jitter
+			while (steady_clock::now() < targetTime) {
+				std::this_thread::sleep_for(std::chrono::microseconds(100)); // 0.1ms sleep for precision
+			}
 		}
 	}
 END:
@@ -2138,27 +2140,12 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 					}
 				}
 				
-				// **SINGLE** color conversion for entire frame (eliminates per-tile overhead)
-				static uint8_t* conversionBuffer = nullptr;
-				static size_t conversionBufferSize = 0;
-				
+				// **DIRECT** frame data copy (no color conversion needed since capture provides BGRA)
 				uint8_t* srcData = bmpState->bmp->Bits();
 				int totalPixels = bmpState->imgW * bmpState->imgH;
-				size_t requiredSize = totalPixels * 4;
 				
-				if (conversionBufferSize < requiredSize) {
-					delete[] conversionBuffer;
-					conversionBuffer = new uint8_t[requiredSize];
-					conversionBufferSize = requiredSize;
-				}
-				
-				if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
-					ColorConversion::ConvertRGBAToBGRA(srcData, conversionBuffer, totalPixels);
-				} else {
-					ColorConversion::ConvertRGBAToBGRA_Scalar(srcData, conversionBuffer, totalPixels);
-				}
-				
-				g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, conversionBuffer);
+				// Direct copy since screen capture already provides correct BGRA format
+				g_frameBuffer.SetFrame(bmpState->imgW, bmpState->imgH, srcData);
 				
 				LeaveCriticalSection(&bmpState->cs);
 				
@@ -2180,7 +2167,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
 			
 			// Additional performance optimization: increase minimum interval for high CPU usage scenarios
-			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)16); // At most 60 FPS invalidation (reduced from 33ms to allow higher FPS)
+			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)8); // Allow up to 120 FPS invalidation for smoother experience
 			
 			if (shouldCheckTiming && (currentTime - lastInvalidateTime < minInterval)) {
 				// Skip this update to maintain synchronized frame rate and reduce paint events
@@ -2226,14 +2213,14 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				avgMbps = (avgMbps * 0.8) + (mbps * 0.2); // Exponential moving average
 				
 				// Detect network congestion and recommend FPS adjustment  
-				bool networkCongested = (avgMbps > 100.0 && framesLastSec < g_streamingFps.load() * 0.7); // Increased threshold to be less aggressive
+				bool networkCongested = (avgMbps > 150.0 && framesLastSec < g_streamingFps.load() * 0.6); // Increased threshold and made less sensitive
 				if (networkCongested) {
 					congestionCounter++;
-					if (congestionCounter >= 5) { // Increased from 3 to 5 seconds to be less aggressive
+					if (congestionCounter >= 7) { // Increased from 5 to 7 seconds to be much less aggressive
 						int currentFps = g_streamingFps.load();
-						if (currentFps > 30) { // Increased from 20 to 30 to allow the default 30 FPS to work
+						if (currentFps > 40) { // Only reduce FPS if above 40 to preserve 30 FPS setting
 							// Automatically reduce FPS to improve stability
-							g_streamingFps.store(std::max(30, currentFps - 10)); // Reduced minimum from 20 to 30
+							g_streamingFps.store(std::max(30, currentFps - 5)); // Reduce by smaller increments (5 instead of 10)
 							std::cout << "🌐 Network congestion detected, reducing FPS to " << g_streamingFps.load() << std::endl;
 						}
 						congestionCounter = 0;
