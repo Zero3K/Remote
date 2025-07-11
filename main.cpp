@@ -1084,42 +1084,18 @@ const int nNormalized = 65535;
 bool CaptureScreenToBasicBitmap_GDI(BasicBitmap*& outBmp);
 
 // --- Capture screen to BasicBitmap, with automatic method selection (Direct2D or GDI) ---
-static BasicBitmap* g_lastCapturedFrame = nullptr; // Cache last successful frame for duplication
-
 bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	// Try Direct2D first if enabled
 	if (g_useDirect2DCapture) {
 		if (Direct2DCapture::CaptureScreenDirect2D(outBmp)) {
-			// Success: update cached frame
-			if (g_lastCapturedFrame) {
-				delete g_lastCapturedFrame;
-			}
-			g_lastCapturedFrame = new BasicBitmap(*outBmp); // Cache copy
 			return true;
 		}
-		// Direct2D failed - if we have a cached frame, duplicate it to maintain smooth playback
-		else if (g_lastCapturedFrame) {
-			outBmp = new BasicBitmap(*g_lastCapturedFrame);
-			return true;
-		}
-		// If Direct2D fails, fall back to GDI automatically (only log once)
-		static bool fallbackLogged = false;
-		if (!fallbackLogged) {
-			std::cout << "⚠️ Direct2D capture failed, falling back to GDI method" << std::endl;
-			fallbackLogged = true;
-		}
+		// If Direct2D fails or times out, fall back to GDI immediately 
+		// This ensures we always get a fresh frame rather than stuck images
 	}
 	
 	// GDI fallback method (original implementation)
-	bool result = CaptureScreenToBasicBitmap_GDI(outBmp);
-	if (result && outBmp) {
-		// Update cache even for GDI captures
-		if (g_lastCapturedFrame) {
-			delete g_lastCapturedFrame;
-		}
-		g_lastCapturedFrame = new BasicBitmap(*outBmp);
-	}
-	return result;
+	return CaptureScreenToBasicBitmap_GDI(outBmp);
 }
 
 // --- GDI-based screen capture (renamed from original function) ---
@@ -1323,12 +1299,12 @@ namespace Direct2DCapture {
 		IDXGIResource* dxgiResource = nullptr;
 		DXGI_OUTDUPL_FRAME_INFO frameInfo;
 
-		// Acquire next frame with appropriate timeout for smooth streaming
-		// Use 16ms timeout (60 FPS) to avoid missing frames
-		hr = g_dxgiDuplication->AcquireNextFrame(16, &frameInfo, &dxgiResource);
+		// Acquire next frame with timeout optimized for responsiveness  
+		// Use 0ms timeout to get the latest frame immediately, fall back to GDI if no update
+		hr = g_dxgiDuplication->AcquireNextFrame(0, &frameInfo, &dxgiResource);
 		if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-			// No new frame available, but don't skip - return false to try again quickly
-			// This prevents frame dropping while maintaining responsiveness
+			// No new frame available - fall back to GDI to ensure fresh capture
+			// This prevents stuck images when desktop isn't updating
 			return false;
 		}
 		if (FAILED(hr)) {
