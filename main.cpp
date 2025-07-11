@@ -1055,6 +1055,7 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	static HDC hScreenDC = nullptr;
 	static HDC hMemDC = nullptr;
 	static HBITMAP hBitmap = nullptr;
+	static HGDIOBJ hOldBitmap = nullptr;
 	static void* pBits = nullptr;
 	static int lastWidth = 0, lastHeight = 0;
 	
@@ -1067,7 +1068,7 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	if (needsRecreate) {
 		// Clean up old resources
 		if (hBitmap) {
-			if (hMemDC) SelectObject(hMemDC, GetStockObject(NULL_BITMAP));
+			if (hMemDC && hOldBitmap) SelectObject(hMemDC, hOldBitmap);
 			DeleteObject(hBitmap);
 		}
 		if (hMemDC) DeleteDC(hMemDC);
@@ -1101,7 +1102,7 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 			return false;
 		}
 		
-		SelectObject(hMemDC, hBitmap);
+		hOldBitmap = SelectObject(hMemDC, hBitmap);
 		lastWidth = width;
 		lastHeight = height;
 	}
