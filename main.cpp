@@ -1117,17 +1117,15 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	uint8_t* src = static_cast<uint8_t*>(pBits);
 	uint8_t* dst = bmp->Bits();
 	
-	// Use the optimized color conversion if available
-	if (ColorConversion::ConvertRGBAToBGRA != nullptr) {
-		ColorConversion::ConvertRGBAToBGRA(src, dst, width * height);
-	} else {
-		// Fallback to manual conversion
-		for (int i = 0; i < width * height; ++i) {
-			dst[i * 4 + 0] = src[i * 4 + 2]; // R
-			dst[i * 4 + 1] = src[i * 4 + 1]; // G
-			dst[i * 4 + 2] = src[i * 4 + 0]; // B
-			dst[i * 4 + 3] = 255;            // A
-		}
+	// Convert from Windows DIB BGRA format to BasicBitmap A8R8G8B8 format
+	// CreateDIBSection with BI_RGB stores data as BGRA in memory
+	// BasicBitmap A8R8G8B8 expects BGRA in memory on little-endian systems
+	// So we can do a direct copy with alpha channel set to 255
+	for (int i = 0; i < width * height; ++i) {
+		dst[i * 4 + 0] = src[i * 4 + 0]; // B (stays B)
+		dst[i * 4 + 1] = src[i * 4 + 1]; // G (stays G)  
+		dst[i * 4 + 2] = src[i * 4 + 2]; // R (stays R)
+		dst[i * 4 + 3] = 255;            // A (set to opaque, was undefined)
 	}
 	
 	outBmp = bmp;
@@ -2182,7 +2180,7 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			uint64_t frameIntervalMs = (currentFps > 0) ? (1000 / currentFps) : 50; // fallback to 20 FPS
 			
 			// Additional performance optimization: increase minimum interval for high CPU usage scenarios
-			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)33); // At most 30 FPS invalidation
+			uint64_t minInterval = std::max(frameIntervalMs, (uint64_t)16); // At most 60 FPS invalidation (reduced from 33ms to allow higher FPS)
 			
 			if (shouldCheckTiming && (currentTime - lastInvalidateTime < minInterval)) {
 				// Skip this update to maintain synchronized frame rate and reduce paint events
@@ -2227,15 +2225,15 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 				static int congestionCounter = 0;
 				avgMbps = (avgMbps * 0.8) + (mbps * 0.2); // Exponential moving average
 				
-				// Detect network congestion and recommend FPS adjustment
-				bool networkCongested = (avgMbps > 50.0 && framesLastSec < g_streamingFps.load() * 0.8);
+				// Detect network congestion and recommend FPS adjustment  
+				bool networkCongested = (avgMbps > 100.0 && framesLastSec < g_streamingFps.load() * 0.7); // Increased threshold to be less aggressive
 				if (networkCongested) {
 					congestionCounter++;
-					if (congestionCounter >= 3) { // 3 seconds of congestion
+					if (congestionCounter >= 5) { // Increased from 3 to 5 seconds to be less aggressive
 						int currentFps = g_streamingFps.load();
-						if (currentFps > 20) {
+						if (currentFps > 30) { // Increased from 20 to 30 to allow the default 30 FPS to work
 							// Automatically reduce FPS to improve stability
-							g_streamingFps.store(std::max(20, currentFps - 10));
+							g_streamingFps.store(std::max(30, currentFps - 10)); // Reduced minimum from 20 to 30
 							std::cout << "🌐 Network congestion detected, reducing FPS to " << g_streamingFps.load() << std::endl;
 						}
 						congestionCounter = 0;
@@ -2577,6 +2575,7 @@ MainWindow* g_pMainWindow = nullptr;
 void SetRemoteScreenFps(HWND hwnd, int fps) {
 	g_screenStreamMenuFps = fps;
 	g_screenStreamActualFps = fps;
+	g_streamingFps.store(fps); // Fix: Update the atomic variable used by streaming thread
 
 	SOCKET* psktInput = (SOCKET*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 	if (!psktInput || *psktInput == INVALID_SOCKET) return;
