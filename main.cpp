@@ -1092,6 +1092,11 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 		}
 		// If Direct2D fails or times out, fall back to GDI immediately 
 		// This ensures we always get a fresh frame rather than stuck images
+		static bool fallbackLogged = false;
+		if (!fallbackLogged) {
+			std::cout << "⚠️ Direct2D capture unavailable, using GDI fallback" << std::endl;
+			fallbackLogged = true;
+		}
 	}
 	
 	// GDI fallback method (original implementation)
@@ -1167,10 +1172,10 @@ bool CaptureScreenToBasicBitmap_GDI(BasicBitmap*& outBmp) {
 	
 	// Direct copy from Windows DIB BGRA to BasicBitmap BGRA format
 	// Both Windows DIB (BI_RGB) and BasicBitmap A8R8G8B8 store as BGRA in memory
-	// Only need to set alpha channel to opaque since DIB doesn't guarantee alpha values
+	// Ensure proper copy and alpha channel initialization
 	memcpy(dst, src, width * height * 4);
 	
-	// Set alpha channel to opaque for all pixels
+	// Set alpha channel to opaque for all pixels to ensure no transparency artifacts
 	for (int i = 0; i < width * height; ++i) {
 		dst[i * 4 + 3] = 255; // Set alpha to opaque
 	}
@@ -1367,8 +1372,15 @@ namespace Direct2DCapture {
 		uint8_t* dst = bmp->Bits();
 
 		// DXGI provides BGRA format, which matches our needs
-		for (int y = 0; y < g_lastHeight; ++y) {
-			memcpy(dst + y * g_lastWidth * 4, src + y * mappedResource.RowPitch, g_lastWidth * 4);
+		// Handle potential row pitch differences due to memory alignment
+		if (mappedResource.RowPitch == (UINT)(g_lastWidth * 4)) {
+			// Optimal case: direct copy
+			memcpy(dst, src, g_lastWidth * g_lastHeight * 4);
+		} else {
+			// Handle row pitch differences
+			for (int y = 0; y < g_lastHeight; ++y) {
+				memcpy(dst + y * g_lastWidth * 4, src + y * mappedResource.RowPitch, g_lastWidth * 4);
+			}
 		}
 
 		// Set alpha channel to opaque
