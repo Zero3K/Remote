@@ -49,6 +49,16 @@
 #include "xrle.h"
 #include "xrle.c"
 
+// Direct2D and DXGI includes for hardware-accelerated screen capture
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <d2d1.h>
+#include <wincodec.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "windowscodecs.lib")
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -951,6 +961,10 @@ extern MainWindow* g_pMainWindow;
 
 #define IDM_ALWAYS_ON_TOP     6020
 
+#define IDM_CAPTURE_METHOD    6025
+#define IDM_CAPTURE_DIRECT2D  6026
+#define IDM_CAPTURE_GDI       6027
+
 #define IDM_SENDKEYS          6030
 #define IDM_SENDKEYS_ALTF4    6031
 #define IDM_SENDKEYS_CTRLESC  6032
@@ -981,6 +995,12 @@ HMENU CreateScreenContextMenu() {
 		AppendMenuA(hFpsMenu, MF_STRING | (g_screenStreamMenuFps == fpsVals[i] ? MF_CHECKED : 0), fpsIDs[i], std::to_string(fpsVals[i]).c_str());
 	}
 	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hFpsMenu, "Video FPS");
+
+	// Capture Method submenu
+	HMENU hCaptureMenu = CreatePopupMenu();
+	AppendMenuA(hCaptureMenu, MF_STRING | (g_useDirect2DCapture ? MF_CHECKED : 0), IDM_CAPTURE_DIRECT2D, "Direct2D (Hardware Accelerated)");
+	AppendMenuA(hCaptureMenu, MF_STRING | (!g_useDirect2DCapture ? MF_CHECKED : 0), IDM_CAPTURE_GDI, "GDI (Software Fallback)");
+	AppendMenuA(hMenu, MF_POPUP, (UINT_PTR)hCaptureMenu, "Capture Method");
 
 	// Always On Top
 	AppendMenuA(hMenu, MF_STRING | (g_alwaysOnTop ? MF_CHECKED : 0), IDM_ALWAYS_ON_TOP, "Always On Top");
@@ -1050,8 +1070,30 @@ int nScreenHeight[2] = { 1080 , 1440 };
 
 const int nNormalized = 65535;
 
-// --- Capture screen to BasicBitmap, with RGBA output and optimizations ---
+// Forward declaration for GDI fallback
+bool CaptureScreenToBasicBitmap_GDI(BasicBitmap*& outBmp);
+
+// --- Capture screen to BasicBitmap, with automatic method selection (Direct2D or GDI) ---
 bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
+	// Try Direct2D first if enabled
+	if (g_useDirect2DCapture) {
+		if (Direct2DCapture::CaptureScreenDirect2D(outBmp)) {
+			return true;
+		}
+		// If Direct2D fails, fall back to GDI automatically (only log once)
+		static bool fallbackLogged = false;
+		if (!fallbackLogged) {
+			std::cout << "⚠️ Direct2D capture failed, falling back to GDI method" << std::endl;
+			fallbackLogged = true;
+		}
+	}
+	
+	// GDI fallback method (original implementation)
+	return CaptureScreenToBasicBitmap_GDI(outBmp);
+}
+
+// --- GDI-based screen capture (renamed from original function) ---
+bool CaptureScreenToBasicBitmap_GDI(BasicBitmap*& outBmp) {
 	static HDC hScreenDC = nullptr;
 	static HDC hMemDC = nullptr;
 	static HBITMAP hBitmap = nullptr;
@@ -1130,6 +1172,213 @@ bool CaptureScreenToBasicBitmap(BasicBitmap*& outBmp) {
 	outBmp = bmp;
 	return true;
 }
+
+// --- Direct2D/DXGI-based hardware-accelerated screen capture ---
+// This provides significantly better performance than GDI on modern systems
+namespace Direct2DCapture {
+	// Global Direct2D resources (initialized once)
+	static ID3D11Device* g_d3dDevice = nullptr;
+	static ID3D11DeviceContext* g_d3dContext = nullptr;
+	static IDXGIOutputDuplication* g_dxgiDuplication = nullptr;
+	static ID3D11Texture2D* g_stagingTexture = nullptr;
+	static int g_lastWidth = 0, g_lastHeight = 0;
+	static bool g_initialized = false;
+
+	bool InitializeDirect2DCapture() {
+		if (g_initialized) return true;
+
+		HRESULT hr;
+		
+		// Create D3D11 device and context
+		D3D_FEATURE_LEVEL featureLevel;
+		hr = D3D11CreateDevice(
+			nullptr,                    // Adapter
+			D3D_DRIVER_TYPE_HARDWARE,   // Driver Type
+			nullptr,                    // Software
+			0,                          // Flags
+			nullptr,                    // Feature Levels
+			0,                          // Feature Levels count
+			D3D11_SDK_VERSION,          // SDK Version
+			&g_d3dDevice,              // Device
+			&featureLevel,             // Feature Level
+			&g_d3dContext              // Context
+		);
+		if (FAILED(hr)) {
+			std::cout << "⚠️ Direct2D: Failed to create D3D11 device (0x" << std::hex << hr << "), falling back to GDI" << std::endl;
+			return false;
+		}
+
+		// Get DXGI device and adapter
+		IDXGIDevice* dxgiDevice = nullptr;
+		hr = g_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
+		if (FAILED(hr)) {
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+			return false;
+		}
+
+		IDXGIAdapter* dxgiAdapter = nullptr;
+		hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&dxgiAdapter);
+		dxgiDevice->Release();
+		if (FAILED(hr)) {
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+			return false;
+		}
+
+		// Get primary output
+		IDXGIOutput* dxgiOutput = nullptr;
+		hr = dxgiAdapter->EnumOutputs(0, &dxgiOutput);
+		dxgiAdapter->Release();
+		if (FAILED(hr)) {
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+			return false;
+		}
+
+		// Get DXGI 1.2 output for duplication
+		IDXGIOutput1* dxgiOutput1 = nullptr;
+		hr = dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void**)&dxgiOutput1);
+		dxgiOutput->Release();
+		if (FAILED(hr)) {
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+			return false;
+		}
+
+		// Create desktop duplication
+		hr = dxgiOutput1->DuplicateOutput(g_d3dDevice, &g_dxgiDuplication);
+		dxgiOutput1->Release();
+		if (FAILED(hr)) {
+			std::cout << "⚠️ Direct2D: Desktop duplication not supported (0x" << std::hex << hr << "), falling back to GDI" << std::endl;
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+			return false;
+		}
+
+		g_initialized = true;
+		std::cout << "🚀 Direct2D: Hardware-accelerated screen capture initialized successfully!" << std::endl;
+		return true;
+	}
+
+	void CleanupDirect2DCapture() {
+		if (g_stagingTexture) {
+			g_stagingTexture->Release();
+			g_stagingTexture = nullptr;
+		}
+		if (g_dxgiDuplication) {
+			g_dxgiDuplication->Release();
+			g_dxgiDuplication = nullptr;
+		}
+		if (g_d3dContext) {
+			g_d3dContext->Release();
+			g_d3dContext = nullptr;
+		}
+		if (g_d3dDevice) {
+			g_d3dDevice->Release();
+			g_d3dDevice = nullptr;
+		}
+		g_initialized = false;
+		g_lastWidth = g_lastHeight = 0;
+	}
+
+	bool CaptureScreenDirect2D(BasicBitmap*& outBmp) {
+		if (!g_initialized) {
+			if (!InitializeDirect2DCapture()) {
+				return false; // Fall back to GDI
+			}
+		}
+
+		HRESULT hr;
+		IDXGIResource* dxgiResource = nullptr;
+		DXGI_OUTDUPL_FRAME_INFO frameInfo;
+
+		// Acquire next frame
+		hr = g_dxgiDuplication->AcquireNextFrame(0, &frameInfo, &dxgiResource);
+		if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+			// No new frame available, return previous frame or false
+			return false;
+		}
+		if (FAILED(hr)) {
+			// Desktop duplication lost, reinitialize
+			CleanupDirect2DCapture();
+			return false;
+		}
+
+		// Get the texture from the resource
+		ID3D11Texture2D* frameTexture = nullptr;
+		hr = dxgiResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTexture);
+		dxgiResource->Release();
+		if (FAILED(hr)) {
+			g_dxgiDuplication->ReleaseFrame();
+			return false;
+		}
+
+		// Get texture description
+		D3D11_TEXTURE2D_DESC frameDesc;
+		frameTexture->GetDesc(&frameDesc);
+
+		// Create staging texture if needed or if size changed
+		if (!g_stagingTexture || g_lastWidth != (int)frameDesc.Width || g_lastHeight != (int)frameDesc.Height) {
+			if (g_stagingTexture) {
+				g_stagingTexture->Release();
+			}
+
+			D3D11_TEXTURE2D_DESC stagingDesc = frameDesc;
+			stagingDesc.Usage = D3D11_USAGE_STAGING;
+			stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			stagingDesc.BindFlags = 0;
+			stagingDesc.MiscFlags = 0;
+
+			hr = g_d3dDevice->CreateTexture2D(&stagingDesc, nullptr, &g_stagingTexture);
+			if (FAILED(hr)) {
+				frameTexture->Release();
+				g_dxgiDuplication->ReleaseFrame();
+				return false;
+			}
+
+			g_lastWidth = (int)frameDesc.Width;
+			g_lastHeight = (int)frameDesc.Height;
+		}
+
+		// Copy frame to staging texture
+		g_d3dContext->CopyResource(g_stagingTexture, frameTexture);
+		frameTexture->Release();
+
+		// Map the staging texture
+		D3D11_MAPPED_SUBRESOURCE mappedResource;
+		hr = g_d3dContext->Map(g_stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
+		if (FAILED(hr)) {
+			g_dxgiDuplication->ReleaseFrame();
+			return false;
+		}
+
+		// Create BasicBitmap and copy data
+		BasicBitmap* bmp = new BasicBitmap(g_lastWidth, g_lastHeight, BasicBitmap::A8R8G8B8);
+		uint8_t* src = static_cast<uint8_t*>(mappedResource.pData);
+		uint8_t* dst = bmp->Bits();
+
+		// DXGI provides BGRA format, which matches our needs
+		for (int y = 0; y < g_lastHeight; ++y) {
+			memcpy(dst + y * g_lastWidth * 4, src + y * mappedResource.RowPitch, g_lastWidth * 4);
+		}
+
+		// Set alpha channel to opaque
+		for (int i = 0; i < g_lastWidth * g_lastHeight; ++i) {
+			dst[i * 4 + 3] = 255;
+		}
+
+		// Unmap and release
+		g_d3dContext->Unmap(g_stagingTexture, 0);
+		g_dxgiDuplication->ReleaseFrame();
+
+		outBmp = bmp;
+		return true;
+	}
+}
+
+// Global setting for capture method
+static bool g_useDirect2DCapture = true; // Default to Direct2D for better performance
 
 
 
@@ -2635,6 +2884,15 @@ LRESULT CALLBACK ScreenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 				g_pMainWindow->SaveConfig();
 			}
 			SetWindowPos(hwnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+			break;
+		case IDM_CAPTURE_DIRECT2D:
+			g_useDirect2DCapture = true;
+			std::cout << "🚀 Switched to Direct2D hardware-accelerated capture" << std::endl;
+			break;
+		case IDM_CAPTURE_GDI:
+			g_useDirect2DCapture = false;
+			Direct2DCapture::CleanupDirect2DCapture(); // Clean up Direct2D resources
+			std::cout << "⚙️ Switched to GDI software capture" << std::endl;
 			break;
 		case IDM_SENDKEYS_ALTF4:    SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_ALTF4); break;
 		case IDM_SENDKEYS_CTRLESC:  SendRemoteKeyCombo(hwnd, IDM_SENDKEYS_CTRLESC); break;
@@ -4248,6 +4506,11 @@ int main(int argc, char* argv[])
 	// Initialize optimal color conversion function pointer
 	ColorConversion::InitializeOptimalConverter();
 
+	// Initialize Direct2D capture system (will fall back to GDI if not supported)
+	if (g_useDirect2DCapture) {
+		Direct2DCapture::InitializeDirect2DCapture();
+	}
+
 	// --- Command line mode check ---
 	std::vector<std::string> args(argv + 1, argv + argc);
 	bool isServer = CmdOptionExists(args, "--server");
@@ -4389,6 +4652,9 @@ int main(int argc, char* argv[])
 	}
 
 	CleanupClipboardMonitor(win.Window());
+
+	// Cleanup Direct2D resources
+	Direct2DCapture::CleanupDirect2DCapture();
 
 	WSACleanup();
 	return 0;
