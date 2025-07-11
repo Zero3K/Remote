@@ -247,11 +247,12 @@ public:
 };
 
 // Global cache for per-window DIB sections
-static std::unordered_map<HWND, struct {
-	HBITMAP hCachedBmp;
-	void* pCachedBits;
-	int cachedSrcW, cachedSrcH;
-}> g_windowCache;
+struct WindowDIBCache {
+	HBITMAP hCachedBmp = NULL;
+	void* pCachedBits = nullptr;
+	int cachedSrcW = 0, cachedSrcH = 0;
+};
+static std::unordered_map<HWND, WindowDIBCache> g_windowCache;
 struct AsyncRenderState {
 	std::mutex frameMutex;
 	std::condition_variable frameReady;
