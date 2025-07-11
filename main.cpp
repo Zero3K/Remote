@@ -906,7 +906,8 @@ void AudioStreamClientThreadXRLE(const std::string& serverIp) {
 		std::vector<uint8_t> xrle_buf(bytes_compressed);
 		if (recvn(sock, (char*)xrle_buf.data(), bytes_compressed) != (int)bytes_compressed) break;
 		std::vector<uint8_t> pcm_buf(bytes_uncompressed);
-		if (xrle_decompress(pcm_buf.data(), xrle_buf.data(), bytes_compressed) != bytes_uncompressed) break;
+		size_t decompressed_size = xrle_decompress(pcm_buf.data(), xrle_buf.data(), bytes_compressed);
+		if (decompressed_size != bytes_uncompressed || decompressed_size == 0) break;
 
 		UINT32 framesToWrite = (bytes_uncompressed / pwfx->nBlockAlign);
 		UINT32 framesWritten = 0;
@@ -2295,8 +2296,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 			std::vector<uint8_t> dirtyBitmask((numTiles + 7) / 8);
 			size_t gotLen = xrle_decompress(dirtyBitmask.data(), xrleBitmask.data(), xrleBitmask.size());
 			SRDPRINTF("ScreenRecvThread: gotLen from xrle_decompress = %zu, expected = %zu\n", gotLen, dirtyBitmask.size());
-			if (gotLen != dirtyBitmask.size()) {
-				SRDPRINTF("ScreenRecvThread: xrle_decompress size mismatch, exiting\n");
+			if (gotLen != dirtyBitmask.size() || gotLen == 0) {
+				SRDPRINTF("ScreenRecvThread: xrle_decompress size mismatch or error, exiting\n");
 				lost_connection = true;
 				break;
 			}
@@ -2369,8 +2370,8 @@ void ScreenRecvThread(SOCKET skt, HWND hwnd, std::string ip, int server_port) {
 					memcpy(qoiData.data(), xrleData.data(), qoiOrigLen);
 				} else {
 					size_t qoiLen = xrle_decompress(qoiData.data(), xrleData.data(), xrleData.size());
-					if (qoiLen != qoiOrigLen) {
-						SRDPRINTF("ScreenRecvThread: decompress failed\n");
+					if (qoiLen != qoiOrigLen || qoiLen == 0) {
+						SRDPRINTF("ScreenRecvThread: decompress failed or error\n");
 						frame_error = true; lost_connection = true; running = false; break;
 					}
 				}
