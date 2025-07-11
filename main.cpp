@@ -69,6 +69,16 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
 
+// Forward declarations for Direct2D capture functionality
+class BasicBitmap;
+namespace Direct2DCapture {
+	bool CaptureScreenDirect2D(BasicBitmap*& outBmp);
+	bool InitializeDirect2DCapture();
+	void CleanupDirect2DCapture();
+}
+
+// Global setting for capture method
+static bool g_useDirect2DCapture = true; // Default to Direct2D for better performance
 
 // Add a helper struct for window placement
 struct RemoteWindowPlacement {
@@ -1377,8 +1387,7 @@ namespace Direct2DCapture {
 	}
 }
 
-// Global setting for capture method
-static bool g_useDirect2DCapture = true; // Default to Direct2D for better performance
+// g_useDirect2DCapture is now declared at the top of the file
 
 
 
