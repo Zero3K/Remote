@@ -592,23 +592,9 @@ struct ScreenBitmapState {
 	CRITICAL_SECTION cs;
 	SOCKET* psktInput = nullptr;
 	MainWindow* mainWindow = nullptr;
-	
-	// Async rendering pipeline
-	AsyncRenderState* asyncRender = nullptr;
 
-	ScreenBitmapState() { 
-		InitializeCriticalSection(&cs);
-		asyncRender = new AsyncRenderState();
-	}
-	~ScreenBitmapState() { 
-		if (bmp) delete bmp; 
-		if (asyncRender) {
-			asyncRender->shouldExit = true;
-			asyncRender->frameReady.notify_all();
-			delete asyncRender;
-		}
-		DeleteCriticalSection(&cs); 
-	}
+	ScreenBitmapState() { InitializeCriticalSection(&cs); }
+	~ScreenBitmapState() { if (bmp) delete bmp; DeleteCriticalSection(&cs); }
 };
 
 /**
@@ -4036,20 +4022,6 @@ int main(int argc, char* argv[])
 		std::cout << "WSAStartup failed: " << wsaResult << std::endl;
 		return 1;
 	}
-
-	// Initialize performance optimizations
-	ColorConversion::InitializeOptimalConverter();
-	
-	// Set high performance mode for this process
-	SetProcessPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-	
-	std::cout << "Ultra-high performance mode enabled:" << std::endl;
-	std::cout << "- Lock-free triple buffering" << std::endl;  
-	std::cout << "- SIMD-optimized color conversion" << std::endl;
-	std::cout << "- Zero-copy memory management" << std::endl;
-	std::cout << "- 60 FPS frame rate limiting" << std::endl;
-	std::cout << "- Hardware-accelerated stretching" << std::endl;
 
 	// --- Command line mode check ---
 	std::vector<std::string> args(argv + 1, argv + argc);
