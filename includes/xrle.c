@@ -91,15 +91,31 @@ size_t xrle_decompress(void * out,const void * in,size_t in_size)
 	U64 *in_pos = (U64 *) in,*out_pos = (U64 *) out,word,tmp;
 	U32 tail = in_size & 7,lit_len,repeat,i;
 	U64 *in_limit = (U64 *)((char *)in + in_size - tail);
+	U64 *out_start = (U64 *) out;
 
 	if(in_size < 16){
 		memcpy(out,in,in_size);
 		return in_size;
 	}
 	while(in_pos < in_limit){
+		// Check if we have enough input for the header
+		if(in_pos + 1 > in_limit) {
+			return 0; // Error: not enough input data
+		}
+		
 		lit_len = ((U32 *) in_pos)[0];
 		repeat = ((U32 *) in_pos)[1];
 		in_pos++;
+
+		// Bounds check for literal length
+		if(lit_len > 0x10000000 || repeat > 0x10000000) {
+			return 0; // Error: suspiciously large values, likely corrupted data
+		}
+		
+		// Check if we have enough input data for literals
+		if(in_pos + lit_len > in_limit) {
+			return 0; // Error: not enough input data for literals
+		}
 
 		for(i = 0;i < lit_len;i++)
 			out_pos[i] = in_pos[i];
@@ -107,6 +123,11 @@ size_t xrle_decompress(void * out,const void * in,size_t in_size)
 		in_pos += lit_len;
 		out_pos += lit_len;
 
+		// Check if we have enough input for the word to repeat
+		if(in_pos >= in_limit) {
+			return 0; // Error: not enough input data for repeat word
+		}
+		
 		word = *in_pos++;
 
 		for(i = 0;i < repeat;i++)
